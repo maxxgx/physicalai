@@ -192,6 +192,8 @@ class BucketSortTask:
         """The current instruction; ``None`` before the first reset."""
         self.slot_colors: tuple[str, ...] = BUCKET_COLORS
         """The bucket colour in each slot, left to right (:data:`SLOT_Y`)."""
+        self.reset_count = 0
+        """How many resets have run: a new value means a new layout and instruction."""
 
     @property
     def allowed_pairs(self) -> tuple[Pair, ...]:
@@ -221,6 +223,7 @@ class BucketSortTask:
             data.mocap_quat[mocap] = _yaw_quat(yaw)
         _place_objects(model, data, rng)
         self.instruction = sample_instruction(rng, self._allowed)
+        self.reset_count += 1
         mujoco.mj_forward(model, data)
         logger.info("Bucket sort: {!r}; buckets left to right {}", self.instruction.text, ", ".join(self.slot_colors))
 

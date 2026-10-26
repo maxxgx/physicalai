@@ -204,8 +204,9 @@ class _FakeSegmentationRenderer:
 
 
 class _FlatBackground:
-    def __init__(self) -> None:
+    def __init__(self, *, moves_objects: bool = False) -> None:
         self.views: list[appearance.View] = []
+        self.moves_objects = moves_objects
 
     def frame(self, view: appearance.View) -> np.ndarray:
         self.views.append(view)
@@ -240,6 +241,14 @@ def test_compositor_keeps_the_robot_and_moved_objects_from_the_sim() -> None:
     mujoco.mj_forward(model, data)
     out = compositor(renderer, data, "cam", frame)
     np.testing.assert_array_equal(out[0, :, 0], [7, 200, 200, 7])
+
+    # A background that redraws objects (a splat) keeps the pushed object, and is told where it is.
+    splat_like = _FlatBackground(moves_objects=True)
+    compositor = appearance.Compositor(model, splat_like, {table, obj}, {obj: np.array([0.0, 0.0, 0.1])})
+    out = compositor(renderer, data, "cam", frame)
+    np.testing.assert_array_equal(out[0, :, 0], [7, 7, 200, 7])
+    position, _ = splat_like.views[-1].objects["object0"]
+    np.testing.assert_allclose(position, [0.05, 0.0, 0.1])
 
 
 @pytest.mark.slow
@@ -515,3 +524,32 @@ def test_capture_camera_matrices_project_like_the_sim_camera() -> None:
     colmap = (image.rotation @ capture_points.T).T + image.translation
     colmap_pixels = colmap[:, :2] / colmap[:, 2:] * FOCAL + [WIDTH / 2, HEIGHT / 2]
     np.testing.assert_allclose(pixels, colmap_pixels, atol=0.05)
+
+
+def test_object_motion_in_capture_moves_points_like_the_body() -> None:
+    from physicalai_mujoco_plugin.real2sim.geometry import Similarity  # noqa: PLC0415
+    from physicalai_mujoco_plugin.real2sim.splats import quats_to_matrices  # noqa: PLC0415
+
+    rotation, offset = _capture_frame()
+    # The capture frame is CAPTURE_SCALE * metric @ rotation.T + offset; its inverse is the scene transform.
+    transform = Similarity(rotation.T, offset, 1 / CAPTURE_SCALE)
+    captured = np.array([0.05, -0.03, 0.0])
+    yaw = math.radians(25.0)
+    body_rotation = np.array([[math.cos(yaw), -math.sin(yaw), 0], [math.sin(yaw), math.cos(yaw), 0], [0, 0, 1]])
+    body_position = np.array([0.15, 0.02, 0.0])
+    on_object = np.array([[0.06, -0.01, 0.03], [0.02, -0.05, 0.07]])  # scene frame, at capture
+
+    motion, shift = appearance.object_motion_in_capture(transform, captured, body_position, body_rotation)
+
+    moved_capture = _to_capture(on_object) @ motion.T + shift
+    expected_scene = (on_object - captured) @ body_rotation.T + body_position
+    np.testing.assert_allclose(transform.apply(moved_capture), expected_scene, atol=1e-12)
+    # Orientations turn with it: a Gaussian's axes in the scene frame are rotated by the body rotation.
+    turned = transform.apply_rotation(motion @ quats_to_matrices(np.array([[1.0, 0, 0, 0]]))[0])
+    np.testing.assert_allclose(turned, body_rotation @ transform.apply_rotation(np.eye(3)), atol=1e-12)
+
+
+def test_object_members_are_the_gaussians_in_its_box() -> None:
+    means = np.array([[0.0, 0.0, 0.05], [0.0, 0.0, 0.001], [0.3, 0.0, 0.05], [0.06, 0.0, 0.1]])
+    inside = appearance.object_members(means, np.array([0.0, 0.0, 0.0]), np.array([0.1, 0.1, 0.12]))
+    np.testing.assert_array_equal(inside, [True, False, False, True])

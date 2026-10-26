@@ -24,7 +24,7 @@ import functools
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import cv2
 import mujoco
@@ -32,7 +32,7 @@ import numpy as np
 from loguru import logger
 
 from physicalai_mujoco_plugin.real2sim.geometry import Similarity
-from physicalai_mujoco_plugin.real2sim.splats import read_ply_fields
+from physicalai_mujoco_plugin.real2sim.splats import matrix_to_quat, read_ply_fields
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -43,6 +43,8 @@ _GEOM = int(mujoco.mjtObj.mjOBJ_GEOM)
 """Segmentation object type of geoms as a plain int; comparing an array with the enum runs per element
 (about 45 ms a 640x427 frame)."""
 
+_Tensor = Any
+"""A torch tensor; torch is optional (only the splat background needs it)."""
 STREAM_WIDTH = 640
 """Width of a capture camera's default stream."""
 MOVED_TOLERANCE = 0.005
@@ -63,6 +65,8 @@ class View:
     cy: float
     width: int
     height: int
+    objects: dict[str, tuple[np.ndarray, np.ndarray]] = dataclasses.field(default_factory=dict)
+    """Captured objects' current body poses in the scene frame: name -> (position, 3x3 rotation)."""
 
 
 def camera_view(model: mujoco.MjModel, data: mujoco.MjData, camera: int, width: int, height: int) -> View:
@@ -97,6 +101,9 @@ def camera_view(model: mujoco.MjModel, data: mujoco.MjData, camera: int, width: 
 class Background(Protocol):
     """The captured environment as one camera sees it."""
 
+    moves_objects: bool
+    """Whether the background redraws captured objects at their current pose (a splat can, a photo cannot)."""
+
     def frame(self, view: View) -> np.ndarray:
         """The captured RGB image for ``view`` (``view.height`` x ``view.width``)."""
         ...
@@ -108,6 +115,7 @@ class PhotoBackground:
 
     path: Path
     _cache: dict[tuple[int, int], np.ndarray] | None = None
+    moves_objects: bool = False
 
     def frame(self, view: View) -> np.ndarray:
         """The photo as RGB at the view's size; the pose is the photo's own.
@@ -150,6 +158,23 @@ def capture_camera_matrices(view: View, transform: Similarity) -> tuple[np.ndarr
     return world_to_cam, intrinsics
 
 
+def object_motion_in_capture(
+    transform: Similarity, captured: np.ndarray, position: np.ndarray, rotation: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """A captured object's rigid motion, expressed in the capture frame: ``p' = R p + t``.
+
+    In the scene frame the body moved from ``captured`` (unrotated, as built) to ``position`` with
+    ``rotation``; the scene frame is ``s R (p - o)`` of the capture frame.
+
+    Returns:
+        ``R`` (3x3) and ``t`` (3,) acting on capture coordinates.
+    """
+    r = transform.rotation
+    motion = r.T @ rotation @ r
+    offset = transform.origin - motion @ transform.origin + r.T @ (position - rotation @ captured) / transform.scale
+    return motion, offset
+
+
 class SplatBackground:
     """A trained Gaussian splat rendered with gsplat (CUDA) from any view.
 
@@ -157,8 +182,24 @@ class SplatBackground:
     view is moved there with the inverse of the scene's :class:`Similarity`.
     """
 
-    def __init__(self, ply: Path, transform: Similarity, *, device: str = "cuda") -> None:
+    moves_objects = True
+
+    def __init__(
+        self,
+        ply: Path,
+        transform: Similarity,
+        *,
+        objects: list[dict[str, object]] | None = None,
+        device: str = "cuda",
+    ) -> None:
         """Load ``ply`` onto ``device``.
+
+        Args:
+            ply: The trained splat, in the capture frame.
+            transform: Capture frame to scene frame.
+            objects: ``real2sim.json``'s objects (name, centre, size): the Gaussians inside each
+                one's box move with its body.
+            device: Torch device.
 
         Raises:
             RuntimeError: If ``device`` is CUDA and no GPU is visible.
@@ -180,6 +221,12 @@ class SplatBackground:
         self._opacities = tensor(1.0 / (1.0 + np.exp(-fields["opacity_logits"])))
         self._sh = tensor(fields["sh"])
         self._sh_degree = round(np.sqrt(fields["sh"].shape[1])) - 1
+        scene_means = transform.apply(fields["means"])
+        self._members: dict[str, tuple[np.ndarray, _Tensor]] = {}
+        for obj in objects or []:
+            inside = object_members(scene_means, np.asarray(obj["center"]), np.asarray(obj["size"]))
+            index = torch.as_tensor(np.flatnonzero(inside), device=device)
+            self._members[str(obj["name"])] = (np.asarray(obj["center"], dtype=float), index)
 
     def frame(self, view: View) -> np.ndarray:
         """Render the splat from ``view``.
@@ -192,10 +239,11 @@ class SplatBackground:
         torch = self._torch
         t = self._transform
         world_to_cam, intrinsics = capture_camera_matrices(view, t)
+        means, quats = self._posed(view)
         with torch.no_grad():
             colors, _, _ = rasterization(
-                self._means,
-                self._quats,
+                means,
+                quats,
                 self._scales,
                 self._opacities,
                 self._sh,
@@ -208,6 +256,65 @@ class SplatBackground:
             )
         image = colors[0].clamp(0, 1).mul(255).byte().cpu().numpy()
         return np.ascontiguousarray(image[:, :, :3])
+
+    def _posed(self, view: View) -> tuple[_Tensor, _Tensor]:
+        """Means and quaternions with every moved object's Gaussians carried along with its body.
+
+        Only the positions and orientations move; the spherical harmonics keep the captured
+        lighting (a turned object shows its old shading, a small error for small turns).
+
+        Returns:
+            Means and quaternions on the device (the loaded tensors when nothing moved).
+        """
+        torch = self._torch
+        means, quats = self._means, self._quats
+        for name, (captured, index) in self._members.items():
+            pose = view.objects.get(name)
+            if pose is None or index.numel() == 0:
+                continue
+            position, rotation = pose
+            if np.linalg.norm(position - captured) <= MOVED_TOLERANCE and np.allclose(rotation, np.eye(3), atol=1e-3):
+                continue
+            if means is self._means:
+                means, quats = means.clone(), quats.clone()
+            motion, offset = object_motion_in_capture(self._transform, captured, position, rotation)
+            r = torch.as_tensor(motion, dtype=torch.float32, device=self._device)
+            means[index] = means[index] @ r.T + torch.as_tensor(offset, dtype=torch.float32, device=self._device)
+            q = torch.as_tensor(matrix_to_quat(motion), dtype=torch.float32, device=self._device)
+            quats[index] = _quat_multiply_torch(q, quats[index])
+        return means, quats
+
+
+def _quat_multiply_torch(a: _Tensor, b: _Tensor) -> _Tensor:
+    """Hamilton product of one w-first quaternion ``a`` with each row of ``b`` (torch).
+
+    Returns:
+        The products.
+    """
+    import torch  # noqa: PLC0415
+
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b.unbind(-1)
+    return torch.stack(
+        [
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ],
+        dim=-1,
+    )
+
+
+def object_members(scene_means: np.ndarray, center: np.ndarray, size: np.ndarray, margin: float = 0.01) -> np.ndarray:
+    """Gaussians inside an object's box (scene frame), above the table.
+
+    Returns:
+        A boolean mask over the Gaussians.
+    """
+    low = np.array([center[0] - size[0] / 2 - margin, center[1] - size[1] / 2 - margin, 0.003])
+    high = np.array([center[0] + size[0] / 2 + margin, center[1] + size[1] / 2 + margin, size[2] + margin])
+    return np.all((scene_means >= low) & (scene_means <= high), axis=1)
 
 
 class Compositor:
@@ -244,15 +351,20 @@ class Compositor:
         finally:
             renderer.disable_segmentation_rendering()
         sim_owned = ~self._environment.copy()
+        poses = {}
         for geom, captured in self._objects.items():
-            if np.linalg.norm(data.xpos[self._geom_body[geom]] - captured) > MOVED_TOLERANCE:
+            body = self._geom_body[geom]
+            poses[self._model.body(body).name] = (data.xpos[body].copy(), data.xmat[body].reshape(3, 3).copy())
+            moved = np.linalg.norm(data.xpos[body] - captured) > MOVED_TOLERANCE
+            if moved and not self._background.moves_objects:
                 sim_owned[geom] = True
         valid = (ids >= 0) & (kinds == _GEOM)
         mask = np.zeros(ids.shape, dtype=bool)
         mask[valid] = sim_owned[ids[valid]]
         height, width = frame.shape[:2]
         camera_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_CAMERA, camera)
-        out = self._background.frame(camera_view(self._model, data, camera_id, width, height)).copy()
+        view = dataclasses.replace(camera_view(self._model, data, camera_id, width, height), objects=poses)
+        out = self._background.frame(view).copy()
         out[mask] = frame[mask]
         return out
 
@@ -302,7 +414,11 @@ def _splat_background(meta: dict[str, object]) -> SplatBackground | None:
     if not ply:
         return None
     try:
-        return SplatBackground(Path(str(ply)), Similarity.from_dict(meta["transform"]))  # type: ignore[arg-type]
+        return SplatBackground(
+            Path(str(ply)),
+            Similarity.from_dict(meta["transform"]),  # type: ignore[arg-type]
+            objects=meta.get("objects"),  # type: ignore[arg-type]
+        )
     except (ImportError, RuntimeError) as exc:
         logger.warning("Splat background unavailable ({}); cameras without a photo keep MuJoCo's rendering", exc)
         return None

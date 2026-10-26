@@ -352,7 +352,10 @@ def test_splat_background_is_skipped_without_gsplat() -> None:
     else:
         if torch.cuda.is_available():
             pytest.skip("gsplat and a GPU are present")
-    meta = {"splat_ply": "missing.ply", "transform": {"rotation": np.eye(3).tolist(), "origin": [0, 0, 0], "scale": 1.0}}
+    meta = {
+        "splat_ply": "missing.ply",
+        "transform": {"rotation": np.eye(3).tolist(), "origin": [0, 0, 0], "scale": 1.0},
+    }
 
     assert appearance._splat_background(meta) is None
     assert appearance._splat_background({"transform": meta["transform"]}) is None
@@ -437,3 +440,42 @@ def test_extract_frames_keeps_the_sharpest_of_each_stretch(tmp_path: Path) -> No
     reference = sharpness(cv2.cvtColor(cv2.imread(str(frames[0])), cv2.COLOR_BGR2GRAY))
     assert reference > 2 * sharpness(cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY))
     assert all(f.name == f"frame_{i:04d}.jpg" for i, f in enumerate(frames))
+
+
+@pytest.mark.slow
+def test_clean_photos_inpaints_the_robot(tmp_path: Path) -> None:
+    import cv2  # noqa: PLC0415
+
+    from physicalai_mujoco_plugin.real2sim.robot_mask import clean_photos  # noqa: PLC0415
+
+    if not offscreen_rendering_available():
+        pytest.skip("no offscreen rendering")
+    model = _synthetic_model()
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    for image in model.images.values():
+        cv2.imwrite(str(photos / image.name), np.full((HEIGHT, WIDTH, 3), 90, np.uint8))
+    scene_dir = tmp_path / "scene"
+    xml = write_scene(
+        scene_dir, model, build_table_scene(model, scale=1 / CAPTURE_SCALE), camera_count=3, images_dir=photos
+    )
+    spec = mujoco.MjSpec.from_file(str(xml))
+    robot = spec.worldbody.add_body(name="robot", pos=[0.0, 0.0, 0.25])
+    robot.add_geom(name="robot_link", type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[0.05, 0, 0])
+    compiled = spec.compile()
+    data = mujoco.MjData(compiled)
+    meta = json.loads((scene_dir / "real2sim.json").read_text())
+    for cam in meta["cameras"]:  # the "real" robot: a white disc where the sphere projects
+        photo = cv2.imread(str(photos / cam["image"]))
+        u, v, depth = project(np.array([[0.0, 0.0, 0.25]]), cam)[0]
+        cv2.circle(photo, (int(u), int(v)), int(cam["fx"] * 0.05 / depth), (255, 255, 255), -1)
+        cv2.imwrite(str(photos / cam["image"]), photo)
+
+    out = clean_photos(compiled, data, scene_dir / "real2sim.json", tmp_path / "clean", dilate_px=4)
+
+    for cam in meta["cameras"]:
+        assert cv2.imread(str(out / cam["image"])).max() < 200  # the white robot is gone
+        assert (out / "masks" / f"{cam['image'].rsplit('.', 1)[0]}.png").exists()
+    meta = json.loads((scene_dir / "real2sim.json").read_text())
+    assert meta["images_dir"] == str(out.resolve())
+    assert meta["raw_images_dir"] == str(photos)

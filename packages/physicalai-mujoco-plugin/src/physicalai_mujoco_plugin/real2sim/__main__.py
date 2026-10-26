@@ -144,6 +144,34 @@ def _sfm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _clean(args: argparse.Namespace) -> int:
+    from physicalai_mujoco_plugin.real2sim.robot_mask import clean_photos  # noqa: PLC0415
+    from physicalai_mujoco_plugin.robot import MuJoCoRobot  # noqa: PLC0415
+
+    scene_dir = Path(args.scene)
+    robot = MuJoCoRobot(args.profile, model_path=str(scene_dir / "scene.xml"), cameras=[])
+    robot.connect()
+    try:
+        sim = robot._sim  # noqa: SLF001 - the robot is posed directly, without physics
+        if sim is None:
+            sys.stderr.write("the simulation did not load\n")
+            return 2
+        if args.joints is not None:
+            sim.channels[0].set_positions(np.array([float(v) for v in args.joints.split(",")]))
+        out = clean_photos(
+            sim.model,
+            sim.data,
+            scene_dir / "real2sim.json",
+            Path(args.out) if args.out else scene_dir / "clean",
+            dilate_px=args.dilate,
+            on_photo=lambda name, fraction: sys.stdout.write(f"{name:24s} {100 * fraction:5.1f}% inpainted\n"),
+        )
+    finally:
+        robot.disconnect()
+    sys.stdout.write(f"cleaned photos in {out}; real2sim.json now uses them\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the ``build`` or ``gate`` command.
 
@@ -205,6 +233,16 @@ def main(argv: list[str] | None = None) -> int:
         "--ply", required=True, help="Trained splat (gsplat / nerfstudio / brush export) on the same capture"
     )
     splat.set_defaults(run=_splat)
+
+    clean = sub.add_parser("clean", help="Inpaint the real robot out of the capture photos (its pose during capture)")
+    clean.add_argument("--scene", required=True, help="Directory written by build")
+    clean.add_argument("--profile", required=True, help="The robot profile, as for start")
+    clean.add_argument(
+        "--joints", default=None, help="Comma-separated joint values in the profile's units (default: home)"
+    )
+    clean.add_argument("--out", default=None, help="Cleaned photo directory (default: <scene>/clean)")
+    clean.add_argument("--dilate", type=int, default=8, help="Grow the robot mask by this many pixels")
+    clean.set_defaults(run=_clean)
 
     args = parser.parse_args(argv)
     return args.run(args)

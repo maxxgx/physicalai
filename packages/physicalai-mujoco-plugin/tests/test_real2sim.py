@@ -13,6 +13,7 @@ seen by cameras on a ring, all expressed in an arbitrary tilted, shifted and sca
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import struct
@@ -355,3 +356,62 @@ def test_splat_background_is_skipped_without_gsplat() -> None:
 
     assert appearance._splat_background(meta) is None
     assert appearance._splat_background({"transform": meta["transform"]}) is None
+
+
+MARKER_SIZE = 0.12
+MARKER_CENTER = np.array([-0.12, 0.10, 0.0])
+MARKER_YAW = math.radians(30.0)
+
+
+def _marker_photos(model: SparseModel, out: Path) -> None:
+    """Draw ArUco 7 lying on the synthetic table into every capture photo (by homography)."""
+    import cv2  # noqa: PLC0415
+
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    pixels, border = 200, 40
+    canvas = np.full((pixels + 2 * border,) * 2, 255, np.uint8)
+    canvas[border:-border, border:-border] = cv2.aruco.generateImageMarker(dictionary, 7, pixels)
+    metres = MARKER_SIZE / pixels
+    middle = (pixels + 2 * border - 1) / 2
+    cos, sin = math.cos(MARKER_YAW), math.sin(MARKER_YAW)
+
+    def on_table(a: float, b: float) -> np.ndarray:  # canvas index coords -> table frame (image y down = marker -y)
+        local = np.array([(a - middle) * metres, -(b - middle) * metres])
+        return MARKER_CENTER + np.array([cos * local[0] - sin * local[1], sin * local[0] + cos * local[1], 0.0])
+
+    src = np.array([[0, 0], [len(canvas) - 1, 0], [len(canvas) - 1, len(canvas) - 1], [0, len(canvas) - 1]], np.float32)
+    world = _to_capture(np.array([on_table(*p) for p in src]))
+    camera = model.cameras[1]
+    intrinsics = np.array([[camera.fx, 0, camera.cx], [0, camera.fy, camera.cy], [0, 0, 1]])
+    for image in model.images.values():  # photos at the camera's own resolution
+        projected = (intrinsics @ (image.rotation @ world.T + image.translation[:, None])).T
+        dst = (projected[:, :2] / projected[:, 2:] - 0.5).astype(np.float32)  # COLMAP pixel centres -> OpenCV
+        homography = cv2.getPerspectiveTransform(src, dst)
+        size = (camera.width, camera.height)
+        photo = cv2.warpPerspective(canvas, homography, size, borderValue=110, flags=cv2.INTER_LINEAR)
+        cv2.imwrite(str(out / image.name), photo)
+
+
+def test_marker_gives_scale_and_robot_mount(tmp_path: Path) -> None:
+    from physicalai_mujoco_plugin.real2sim.markers import find_marker, mount_from_marker  # noqa: PLC0415
+
+    model = _synthetic_model()
+    # Phone photos are large; a marker only ~40 px wide biases its corners inwards by ~1%.
+    model = dataclasses.replace(model, cameras={1: model.cameras[1].scaled(3 * WIDTH, 3 * HEIGHT)})
+    _marker_photos(model, tmp_path)
+
+    marker = find_marker(tmp_path, model, 7)
+
+    assert marker.views >= 8
+    assert marker.residual_px < 1.0
+    scale = MARKER_SIZE / marker.side
+    assert scale == pytest.approx(1 / CAPTURE_SCALE, rel=0.005)
+    scene = build_table_scene(model, scale=scale)
+    # The table frame's own x axis is arbitrary (principal axis); compare in the marker's terms instead.
+    center = scene.transform.apply(marker.center[None])[0]
+    assert center[2] == pytest.approx(0.0, abs=0.003)
+    mount, yaw = mount_from_marker(marker, scene.transform, (0.0, -0.25), 90.0)
+    assert np.linalg.norm(np.array(mount[:2]) - center[:2]) == pytest.approx(0.25, abs=0.005)
+    x_axis = scene.transform.apply_rotation(marker.axes())[:, 0]
+    marker_yaw = math.degrees(math.atan2(x_axis[1], x_axis[0]))
+    assert yaw == pytest.approx(marker_yaw + 90.0)

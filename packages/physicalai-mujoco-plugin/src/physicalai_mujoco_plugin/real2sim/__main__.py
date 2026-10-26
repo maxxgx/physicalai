@@ -42,7 +42,24 @@ def _build(args: argparse.Namespace) -> int:
         return 2
     height, width = photo.shape[:2]
     model = dataclasses.replace(model, cameras={k: c.scaled(width, height) for k, c in model.cameras.items()})
-    scene = build_table_scene(model, scale=args.scale, table_height=args.table_height)
+    scale_value, marker = args.scale, None
+    if args.marker_size is not None:
+        from physicalai_mujoco_plugin.real2sim.markers import find_marker  # noqa: PLC0415
+
+        marker = find_marker(images, model, args.marker_id, args.marker_dict)
+        scale_value = args.marker_size / marker.side
+        sys.stdout.write(
+            f"marker {marker.marker_id}: {marker.views} photos, residual {marker.residual_px:.2f} px, "
+            f"scale {scale_value:.4f} m/unit\n"
+        )
+    scene = build_table_scene(model, scale=scale_value, table_height=args.table_height)
+    mount, yaw = args.mount, args.yaw
+    if marker is not None and args.mount_from_marker is not None:
+        from physicalai_mujoco_plugin.real2sim.markers import mount_from_marker  # noqa: PLC0415
+
+        dx, dy, dyaw = args.mount_from_marker
+        mount, yaw = mount_from_marker(marker, scene.transform, (dx, dy), dyaw)
+        sys.stdout.write(f"robot_mount at {np.round(mount, 3)} yaw {yaw:.1f} deg (from the marker)\n")
     xml = write_scene(
         Path(args.out),
         model,
@@ -50,8 +67,8 @@ def _build(args: argparse.Namespace) -> int:
         camera_count=args.cameras,
         images_dir=images,
         name=args.name,
-        mount=args.mount,
-        mount_yaw_deg=args.yaw,
+        mount=mount,
+        mount_yaw_deg=yaw,
         free_objects=not args.static_objects,
     )
     sys.stdout.write(
@@ -121,6 +138,15 @@ def main(argv: list[str] | None = None) -> int:
     scale = build.add_mutually_exclusive_group(required=True)
     scale.add_argument("--scale", type=float, help="Metres per capture unit (from a marker or a measured length)")
     scale.add_argument("--table-height", type=float, help="Table height in metres; needs the floor in the capture")
+    scale.add_argument("--marker-size", type=float, help="Side of the ArUco marker on the table, in metres")
+    build.add_argument("--marker-id", type=int, default=0, help="ArUco marker id (with --marker-size)")
+    build.add_argument("--marker-dict", default="DICT_4X4_50", help="ArUco dictionary name in cv2.aruco")
+    build.add_argument(
+        "--mount-from-marker",
+        type=_parse_triplet,
+        default=None,
+        help="Robot base x,y (metres) and yaw (degrees) in the marker frame; overrides --mount/--yaw",
+    )
     build.add_argument("--mount", type=_parse_triplet, default=(-0.30, 0.0, 0.0), help="robot_mount x,y,z on the table")
     build.add_argument("--yaw", type=float, default=0.0, help="robot_mount yaw in degrees (0 faces +x)")
     build.add_argument("--cameras", type=int, default=8, help="Capture cameras to export, spread around the table")

@@ -1,0 +1,259 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+"""real2sim: COLMAP reading, table alignment, scene export and real-appearance compositing.
+
+A synthetic capture stands in for a real one: a 0.6 m table with a 0.2 x 0.1 x 0.08 m box on it,
+seen by cameras on a ring, all expressed in an arbitrary tilted, shifted and scaled capture frame
+(what COLMAP produces). The pipeline must recover the metric table frame and the box from it.
+"""
+
+# MuJoCo's bindings are supplied by the C extension at runtime.
+# pyrefly: ignore-errors [missing-attribute]
+
+from __future__ import annotations
+
+import json
+import math
+import struct
+from typing import TYPE_CHECKING
+
+import mujoco
+import numpy as np
+import pytest
+
+from physicalai_mujoco_plugin.cameras import offscreen_rendering_available
+from physicalai_mujoco_plugin.real2sim import appearance
+from physicalai_mujoco_plugin.real2sim.colmap import Camera, Image, SparseModel, quat_to_matrix, read_model
+from physicalai_mujoco_plugin.real2sim.gate import project
+from physicalai_mujoco_plugin.real2sim.geometry import build_table_scene, connected_clusters
+from physicalai_mujoco_plugin.real2sim.scene_builder import write_scene
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+CAPTURE_SCALE = 3.0
+"""Capture units per metre in the synthetic capture (the pipeline must undo it)."""
+WIDTH, HEIGHT, FOCAL = 320, 240, 260.0
+BOX_SIZE = np.array([0.2, 0.1, 0.08])
+BOX_CENTER = np.array([0.05, -0.03])
+
+
+def _capture_frame() -> tuple[np.ndarray, np.ndarray]:
+    """Rotation and offset from the metric table frame to the synthetic capture frame."""
+    rotation = quat_to_matrix(np.array([0.9, 0.3, -0.2, 0.25]))
+    return rotation, np.array([1.5, -0.7, 2.0])
+
+
+def _to_capture(points: np.ndarray) -> np.ndarray:
+    rotation, offset = _capture_frame()
+    return CAPTURE_SCALE * points @ rotation.T + offset
+
+
+def _synthetic_model() -> SparseModel:
+    rng = np.random.default_rng(1)
+    table = np.column_stack([rng.uniform(-0.3, 0.3, (6000, 2)), np.zeros(6000)])
+    low = np.array([*(BOX_CENTER - BOX_SIZE[:2] / 2), 0.0])
+    box = low + rng.uniform(0, 1, (3000, 3)) * BOX_SIZE
+    points = np.vstack([table, box])
+    colors = np.vstack([np.full((len(table), 3), (150, 100, 60)), np.full((len(box), 3), (230, 200, 20))]).astype(
+        np.uint8
+    )
+
+    rotation, _ = _capture_frame()
+    images = {}
+    for i, azimuth in enumerate(np.linspace(0, 2 * math.pi, 12, endpoint=False)):
+        center = np.array([0.6 * math.cos(azimuth), 0.6 * math.sin(azimuth), 0.4])
+        forward = -center / np.linalg.norm(center)
+        right = np.cross(forward, [0, 0, 1])
+        right /= np.linalg.norm(right)
+        down = np.cross(forward, right)
+        cam_to_world = rotation @ np.column_stack([right, down, forward])  # COLMAP: x right, y down, z forward
+        world_center = _to_capture(center[None])[0]
+        world_to_cam = cam_to_world.T
+        images[i + 1] = Image(i + 1, f"{i:03d}.png", 1, world_to_cam, -world_to_cam @ world_center)
+    return SparseModel(
+        cameras={1: Camera(1, "PINHOLE", WIDTH, HEIGHT, (FOCAL, FOCAL, WIDTH / 2, HEIGHT / 2))},
+        images=images,
+        points=_to_capture(points),
+        colors=colors,
+        errors=np.full(len(points), 0.5),
+        track_lengths=np.full(len(points), 5),
+    )
+
+
+def test_colmap_binary_round_trip(tmp_path: Path) -> None:
+    sparse = tmp_path / "sparse"
+    sparse.mkdir()
+    with (sparse / "cameras.bin").open("wb") as f:
+        f.write(struct.pack("<Q", 2))
+        f.write(struct.pack("<iiQQ", 1, 2, 640, 480) + struct.pack("<4d", 500.0, 320.0, 240.0, 0.01))  # SIMPLE_RADIAL
+        f.write(struct.pack("<iiQQ", 2, 1, 800, 600) + struct.pack("<4d", 700.0, 710.0, 401.0, 299.0))  # PINHOLE
+    with (sparse / "images.bin").open("wb") as f:
+        f.write(struct.pack("<Q", 1))
+        f.write(struct.pack("<i7di", 7, 1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 2) + b"a.jpg\x00")
+        f.write(struct.pack("<Q", 2) + struct.pack("<ddq", 1.0, 2.0, 5) * 2)
+    with (sparse / "points3D.bin").open("wb") as f:
+        f.write(struct.pack("<Q", 2))
+        for pid, track in ((5, 3), (6, 1)):
+            f.write(struct.pack("<Q3d3BdQ", pid, 0.1 * pid, 0.2, 0.3, 10, 20, pid, 0.7, track))
+            f.write(struct.pack("<ii", 7, 0) * track)
+
+    model = read_model(sparse)
+
+    simple, pinhole = model.cameras[1], model.cameras[2]
+    assert (simple.fx, simple.fy, simple.cx, simple.cy) == (500.0, 500.0, 320.0, 240.0)
+    assert (pinhole.fx, pinhole.fy, pinhole.cx, pinhole.cy) == (700.0, 710.0, 401.0, 299.0)
+    assert pinhole.scaled(400, 300).fx == pytest.approx(350.0)
+    image = model.images[7]
+    assert image.name == "a.jpg"
+    np.testing.assert_allclose(image.center, [-1.0, -2.0, -3.0])
+    np.testing.assert_allclose(model.points, [[0.5, 0.2, 0.3], [0.6, 0.2, 0.3]])
+    np.testing.assert_array_equal(model.colors[:, 2], [5, 6])
+    np.testing.assert_array_equal(model.track_lengths, [3, 1])
+
+
+def test_table_frame_and_object_are_recovered() -> None:
+    scene = build_table_scene(_synthetic_model(), scale=1 / CAPTURE_SCALE)
+
+    assert len(scene.objects) == 1
+    box = scene.objects[0]
+    # The table frame's x axis is the table points' principal axis, so the box may come out turned
+    # in the plane; its height and footprint area are frame-independent.
+    assert box.size[2] == pytest.approx(BOX_SIZE[2], abs=0.01)
+    footprint = box.points[:, :2] - box.points[:, :2].mean(axis=0)
+    extents = np.sort(np.ptp(footprint @ np.linalg.svd(footprint, full_matrices=False)[2].T, axis=0))
+    np.testing.assert_allclose(extents, np.sort(BOX_SIZE[:2]), atol=0.015)
+    assert np.linalg.norm(box.center[:2]) == pytest.approx(np.linalg.norm(BOX_CENTER), abs=0.01)
+    np.testing.assert_allclose(scene.table_max - scene.table_min, [0.6, 0.6], atol=0.03)
+
+
+def test_scale_needs_a_floor_or_a_value() -> None:
+    with pytest.raises(ValueError, match="pass scale"):
+        build_table_scene(_synthetic_model(), table_height=0.75)
+
+
+def test_connected_clusters_split_objects_that_do_not_touch() -> None:
+    a = np.random.default_rng(0).uniform(0, 0.05, (200, 3))
+    labels = connected_clusters(np.vstack([a, a + [0.2, 0, 0]]), voxel=0.015)
+    assert len(set(labels[:200])) == 1
+    assert len(set(labels[200:])) == 1
+    assert labels[0] != labels[-1]
+
+
+def test_written_scene_compiles_with_capture_cameras(tmp_path: Path) -> None:
+    model = _synthetic_model()
+    scene = build_table_scene(model, scale=1 / CAPTURE_SCALE)
+
+    xml = write_scene(tmp_path, model, scene, camera_count=4, images_dir=tmp_path)
+
+    compiled = mujoco.MjModel.from_xml_path(str(xml))
+    cameras = [compiled.camera(i).name for i in range(compiled.ncam)]
+    assert cameras[0] == "overview"
+    assert len(cameras) == 4
+    np.testing.assert_allclose(compiled.cam_resolution[0], [WIDTH, HEIGHT])
+    assert "robot_mount" in xml.read_text()
+    meta = json.loads((tmp_path / "real2sim.json").read_text())
+    assert meta["transform"]["scale"] == pytest.approx(1 / CAPTURE_SCALE)
+    assert meta["images_dir"] == str(tmp_path.resolve())
+    # The exported camera sits where the capture camera was, in the table frame.
+    for cam in meta["cameras"]:
+        assert np.linalg.norm(cam["position"][:2]) == pytest.approx(0.6, abs=0.01)
+        assert cam["position"][2] == pytest.approx(0.4, abs=0.01)
+    # The box's own points project into the overview camera near the image centre (cameras look at it).
+    uvd = project(np.array([[*BOX_CENTER, 0.04]]), meta["cameras"][0])
+    assert abs(uvd[0, 0] - WIDTH / 2) < WIDTH / 4
+    assert abs(uvd[0, 1] - HEIGHT / 2) < HEIGHT / 4
+
+
+def test_object_rests_on_the_table(tmp_path: Path) -> None:
+    model = _synthetic_model()
+    xml = write_scene(tmp_path, model, build_table_scene(model, scale=1 / CAPTURE_SCALE), camera_count=2)
+    compiled = mujoco.MjModel.from_xml_path(str(xml))
+    data = mujoco.MjData(compiled)
+    body = compiled.body("object0").id
+    start = compiled.body_pos[body].copy()
+
+    for _ in range(500):
+        mujoco.mj_step(compiled, data)
+
+    assert np.linalg.norm(data.xpos[body] - start) < 0.003
+
+
+class _FakeSegmentationRenderer:
+    """Stands in for ``mujoco.Renderer``: returns a fixed geom-id image in segmentation mode."""
+
+    def __init__(self, ids: np.ndarray) -> None:
+        self.ids = ids
+        self.segmentation = False
+
+    def enable_segmentation_rendering(self) -> None:
+        self.segmentation = True
+
+    def disable_segmentation_rendering(self) -> None:
+        self.segmentation = False
+
+    def update_scene(self, data: object, camera: str) -> None:
+        pass
+
+    def render(self) -> np.ndarray:
+        assert self.segmentation
+        kinds = np.where(self.ids >= 0, int(mujoco.mjtObj.mjOBJ_GEOM), -1)
+        return np.stack([self.ids, kinds], axis=-1)
+
+
+class _FlatBackground:
+    def frame(self, width: int, height: int) -> np.ndarray:
+        return np.full((height, width, 3), 7, dtype=np.uint8)
+
+
+def test_compositor_keeps_the_robot_and_moved_objects_from_the_sim() -> None:
+    xml = """<mujoco><worldbody>
+      <geom name="table" type="box" size="1 1 0.01"/>
+      <body name="object0" pos="0 0 0.1"><freejoint/><geom name="object0_geom" type="box" size="0.05 0.05 0.05"/></body>
+      <body name="link"><geom name="robot_link" type="sphere" size="0.05" pos="0.5 0 0.5"/></body>
+    </worldbody></mujoco>"""
+    model = mujoco.MjModel.from_xml_string(xml)
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    table, obj, link = (model.geom(n).id for n in ("table", "object0_geom", "robot_link"))
+    ids = np.array([[table, obj, link, -1]])
+    frame = np.full((1, 4, 3), 200, dtype=np.uint8)
+    compositor = appearance.Compositor(model, _FlatBackground(), {table, obj}, {obj: np.array([0.0, 0.0, 0.1])})
+    renderer = _FakeSegmentationRenderer(ids)
+
+    out = compositor(renderer, data, "cam", frame)
+    np.testing.assert_array_equal(out[0, :, 0], [7, 7, 200, 7])  # only the robot comes from the sim
+    assert not renderer.segmentation
+
+    data.qpos[0] += 0.05  # the object was pushed
+    mujoco.mj_forward(model, data)
+    out = compositor(renderer, data, "cam", frame)
+    np.testing.assert_array_equal(out[0, :, 0], [7, 200, 200, 7])
+
+
+@pytest.mark.slow
+def test_capture_camera_intrinsics_match_mujoco_rendering() -> None:
+    """MuJoCo's principal point is the offset of the image centre from it; a sign error moves every pixel."""
+    if not offscreen_rendering_available():
+        pytest.skip("no offscreen rendering")
+    width, height, fx, fy, cx, cy = 320, 240, 250.0, 260.0, 150.0, 130.0
+    cam = {"position": [0, 0, 0], "xyaxes": [1, 0, 0, 0, 1, 0], "fx": fx, "fy": fy, "cx": cx, "cy": cy}
+    point = np.array([0.1, 0.05, -1.0])
+    xml = f"""<mujoco><visual><global offwidth="{width}" offheight="{height}"/></visual><worldbody>
+      <light pos="0 0 3" dir="0 0 -1"/>
+      <geom type="sphere" size="0.006" pos="{point[0]} {point[1]} {point[2]}" rgba="1 0 0 1"/>
+      <camera name="c" resolution="{width} {height}" focalpixel="{fx} {fy}"
+        principalpixel="{width / 2 - cx} {height / 2 - cy}" sensorsize="0.0032 0.0024"/>
+    </worldbody></mujoco>"""
+    model = mujoco.MjModel.from_xml_string(xml)
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    with mujoco.Renderer(model, height, width) as renderer:
+        renderer.update_scene(data, "c")
+        image = renderer.render()
+    rows, cols = np.nonzero((image[:, :, 0] > 150) & (image[:, :, 1] < 80))
+
+    expected = project(point[None], cam)[0]
+    assert cols.mean() + 0.5 == pytest.approx(expected[0], abs=1.0)
+    assert rows.mean() + 0.5 == pytest.approx(expected[1], abs=1.0)

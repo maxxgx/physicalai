@@ -213,6 +213,7 @@ class MuJoCoRobot(OperatorControls):
         )
         self._objects = SceneObjects(self._area, self._state_lock)
         self._cameras = CameraService(self._camera_arg or [])
+        self._appearance = appearance
         if appearance is not None:
             from physicalai_mujoco_plugin.real2sim.appearance import compositor_factory  # noqa: PLC0415
 
@@ -312,7 +313,7 @@ class MuJoCoRobot(OperatorControls):
         )
         if self._camera_arg is None:
             # Before the viewer opens: its panel lists the configured cameras (the Cameras folder).
-            self._cameras.configs = self._default_cameras(sim)
+            self._cameras.configs = self._default_streams(sim)
         if self._enable_viewer:
             from physicalai_mujoco_plugin.viewer import ViewerService  # noqa: PLC0415
 
@@ -536,6 +537,19 @@ class MuJoCoRobot(OperatorControls):
             overview=self._overview,
         )
 
+    def _default_streams(self, sim: Sim) -> list[CameraConfig]:
+        """The default streams; with real appearance, capture cameras keep the capture's aspect.
+
+        Returns:
+            The camera streams to start.
+        """
+        streams = self._default_cameras(sim)
+        if self._appearance is None:
+            return streams
+        from physicalai_mujoco_plugin.real2sim.appearance import capture_streams  # noqa: PLC0415
+
+        return capture_streams(self._appearance, streams)
+
     @staticmethod
     def _default_cameras(sim: Sim) -> list[CameraConfig]:
         """Return the default streams, or none where MuJoCo cannot render (a headless host without EGL).
@@ -610,7 +624,7 @@ class MuJoCoRobot(OperatorControls):
             return False
 
         # A failed rendering probe runs again here and can take seconds: not under the lock.
-        streams = self._default_cameras(sim) if self._camera_arg is None else None
+        streams = self._default_streams(sim) if self._camera_arg is None else None
         # The camera thread renders the old model; stop it before taking the lock.
         self._cameras.stop()
         with self._state_lock:

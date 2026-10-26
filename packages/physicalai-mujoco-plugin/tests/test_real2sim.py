@@ -257,3 +257,15 @@ def test_capture_camera_intrinsics_match_mujoco_rendering() -> None:
     expected = project(point[None], cam)[0]
     assert cols.mean() + 0.5 == pytest.approx(expected[0], abs=1.0)
     assert rows.mean() + 0.5 == pytest.approx(expected[1], abs=1.0)
+
+
+def test_capture_streams_keep_the_capture_aspect(tmp_path: Path) -> None:
+    from physicalai_mujoco_plugin.cameras import CameraConfig  # noqa: PLC0415
+
+    meta = tmp_path / "real2sim.json"
+    meta.write_text(json.dumps({"cameras": [{"name": "overview", "width": 779, "height": 520}]}))
+
+    streams = appearance.capture_streams(meta, [CameraConfig("wrist"), CameraConfig("overview", fps=15)])
+
+    assert (streams[0].width, streams[0].height) == (640, 480)
+    assert (streams[1].width, streams[1].height, streams[1].fps) == (640, 427, 15)

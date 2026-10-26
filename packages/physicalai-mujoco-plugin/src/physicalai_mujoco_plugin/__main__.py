@@ -128,6 +128,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     start.add_argument(
+        "--appearance",
+        type=str,
+        default=None,
+        help=(
+            "real2sim.json of a captured scene (python -m physicalai_mujoco_plugin.real2sim build); its capture "
+            "cameras show the captured environment behind the simulated robot. Use with --model"
+        ),
+    )
+    start.add_argument(
         "--profile",
         type=str,
         default="so101",
@@ -541,6 +550,7 @@ def _run_start(args: argparse.Namespace, status: _StatusWriter) -> None:  # noqa
         scene=scene_id,
         bimanual=args.bimanual,
         model_path=args.model,
+        appearance=args.appearance,
         unit=args.unit,
         substeps=args.substeps,
         rate_hz=args.rate_hz,

@@ -18,6 +18,7 @@ leaves its captured image behind (a per-object splat removes that).
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import json
 from dataclasses import dataclass
@@ -32,6 +33,10 @@ from loguru import logger
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from physicalai_mujoco_plugin.cameras import CameraConfig
+
+STREAM_WIDTH = 640
+"""Width of a capture camera's default stream."""
 MOVED_TOLERANCE = 0.005
 """An object farther than this (metres) from its captured position is drawn by the sim."""
 
@@ -157,3 +162,24 @@ def compositor_factory(meta_path: str | Path) -> Callable[[mujoco.MjModel], dict
     meta_path = Path(meta_path)
     images_dir = Path(json.loads(meta_path.read_text(encoding="utf-8"))["images_dir"])
     return functools.partial(load_compositors, meta_path, images_dir)
+
+
+def capture_streams(meta_path: str | Path, streams: list[CameraConfig]) -> list[CameraConfig]:
+    """``streams`` with each capture camera resized to its photo's aspect (640 wide).
+
+    MuJoCo renders a camera with real intrinsics at its sensor's aspect; a 640x480 stream of a 3:2
+    photo would stretch the sim against the captured background.
+
+    Returns:
+        The streams, capture cameras resized.
+    """
+    meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+    sizes = {cam["name"]: (int(cam["width"]), int(cam["height"])) for cam in meta["cameras"]}
+    return [
+        dataclasses.replace(
+            stream, width=STREAM_WIDTH, height=round(STREAM_WIDTH * sizes[stream.name][1] / sizes[stream.name][0])
+        )
+        if stream.name in sizes
+        else stream
+        for stream in streams
+    ]

@@ -553,3 +553,31 @@ def test_object_members_are_the_gaussians_in_its_box() -> None:
     means = np.array([[0.0, 0.0, 0.05], [0.0, 0.0, 0.001], [0.3, 0.0, 0.05], [0.06, 0.0, 0.1]])
     inside = appearance.object_members(means, np.array([0.0, 0.0, 0.0]), np.array([0.1, 0.1, 0.12]))
     np.testing.assert_array_equal(inside, [True, False, False, True])
+
+
+def test_splat_background_carries_moved_object_gaussians() -> None:
+    torch = pytest.importorskip("torch")
+    from physicalai_mujoco_plugin.real2sim.geometry import Similarity  # noqa: PLC0415
+    from physicalai_mujoco_plugin.real2sim.splats import quats_to_matrices  # noqa: PLC0415
+
+    rotation, offset = _capture_frame()
+    transform = Similarity(rotation.T, offset, 1 / CAPTURE_SCALE)
+    scene_means = np.array([[0.0, 0.0, 0.05], [0.5, 0.5, 0.05]])  # one on the object, one elsewhere
+    background = object.__new__(appearance.SplatBackground)  # no gsplat needed to pose Gaussians
+    background._torch = torch
+    background._device = "cpu"
+    background._transform = transform
+    background._means = torch.as_tensor(_to_capture(scene_means), dtype=torch.float32)
+    background._quats = torch.as_tensor([[1.0, 0, 0, 0], [1.0, 0, 0, 0]])
+    background._members = {"object0": (np.zeros(3), torch.as_tensor([0]))}
+    yaw = math.radians(90.0)
+    turn = np.array([[math.cos(yaw), -math.sin(yaw), 0], [math.sin(yaw), math.cos(yaw), 0], [0, 0, 1]])
+    view = appearance.View(np.zeros(3), np.eye(3), 1, 1, 0, 0, 1, 1, objects={"object0": (np.array([0.1, 0, 0]), turn)})
+
+    means, quats = background._posed(view)
+
+    moved = transform.apply(means.numpy().astype(np.float64))
+    np.testing.assert_allclose(moved, [[0.1, 0.0, 0.05], [0.5, 0.5, 0.05]], atol=1e-5)
+    np.testing.assert_allclose(background._means.numpy(), _to_capture(scene_means), atol=1e-5)  # loaded copy kept
+    turned = transform.apply_rotation(quats_to_matrices(quats.numpy().astype(np.float64))[0])
+    np.testing.assert_allclose(turned, turn @ transform.apply_rotation(np.eye(3)), atol=1e-5)

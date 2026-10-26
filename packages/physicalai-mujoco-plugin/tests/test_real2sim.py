@@ -479,3 +479,39 @@ def test_clean_photos_inpaints_the_robot(tmp_path: Path) -> None:
     meta = json.loads((scene_dir / "real2sim.json").read_text())
     assert meta["images_dir"] == str(out.resolve())
     assert meta["raw_images_dir"] == str(photos)
+
+
+def test_capture_camera_matrices_project_like_the_sim_camera() -> None:
+    """The splat renders in the capture frame; its camera must see what the sim camera sees."""
+    model = _synthetic_model()
+    scene = build_table_scene(model, scale=1 / CAPTURE_SCALE)
+    image = model.images[3]
+    cam = dataclasses.asdict(
+        __import__("physicalai_mujoco_plugin.real2sim.scene_builder", fromlist=["capture_camera"]).capture_camera(
+            "c", image, model.cameras[1], scene
+        )
+    )
+    axes = np.asarray(cam["xyaxes"])
+    view = appearance.View(
+        position=np.asarray(cam["position"]),
+        rotation=np.column_stack([axes[:3], axes[3:], np.cross(axes[:3], axes[3:])]),
+        fx=cam["fx"],
+        fy=cam["fy"],
+        cx=cam["cx"],
+        cy=cam["cy"],
+        width=WIDTH,
+        height=HEIGHT,
+    )
+    capture_points = _to_capture(np.array([[0.05, -0.03, 0.04], [0.2, 0.1, 0.0], [-0.1, 0.2, 0.06]]))
+    table_points = scene.transform.apply(capture_points)  # the recovered frame, not the synthetic one
+
+    world_to_cam, intrinsics = appearance.capture_camera_matrices(view, scene.transform)
+
+    in_cam = (world_to_cam[:3, :3] @ capture_points.T).T + world_to_cam[:3, 3]
+    pixels = (intrinsics @ in_cam.T).T
+    pixels = pixels[:, :2] / pixels[:, 2:]
+    np.testing.assert_allclose(pixels, project(table_points, cam)[:, :2], atol=1e-6)
+    # ...and match the COLMAP camera the photo was taken with.
+    colmap = (image.rotation @ capture_points.T).T + image.translation
+    colmap_pixels = colmap[:, :2] / colmap[:, 2:] * FOCAL + [WIDTH / 2, HEIGHT / 2]
+    np.testing.assert_allclose(pixels, colmap_pixels, atol=0.05)

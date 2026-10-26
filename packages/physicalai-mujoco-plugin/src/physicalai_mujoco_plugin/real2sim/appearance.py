@@ -133,6 +133,23 @@ class PhotoBackground:
         return self._cache[key]
 
 
+def capture_camera_matrices(view: View, transform: Similarity) -> tuple[np.ndarray, np.ndarray]:
+    """``view`` as an OpenCV camera in the capture frame (where a splat lives).
+
+    MuJoCo cameras look along ``-z`` with ``y`` up; OpenCV (and gsplat) along ``+z`` with ``y`` down.
+
+    Returns:
+        The 4x4 world-to-camera matrix in capture coordinates and the 3x3 pixel intrinsics.
+    """
+    center = transform.origin + transform.rotation.T @ view.position / transform.scale
+    cam_to_capture = transform.rotation.T @ view.rotation @ np.diag([1.0, -1.0, -1.0])
+    world_to_cam = np.eye(4)
+    world_to_cam[:3, :3] = cam_to_capture.T
+    world_to_cam[:3, 3] = -cam_to_capture.T @ center
+    intrinsics = np.array([[view.fx, 0, view.cx], [0, view.fy, view.cy], [0, 0, 1]])
+    return world_to_cam, intrinsics
+
+
 class SplatBackground:
     """A trained Gaussian splat rendered with gsplat (CUDA) from any view.
 
@@ -174,13 +191,7 @@ class SplatBackground:
 
         torch = self._torch
         t = self._transform
-        center = t.origin + t.rotation.T @ view.position / t.scale
-        # MuJoCo cameras look along -z with y up; OpenCV/gsplat along +z with y down.
-        cam_to_capture = t.rotation.T @ view.rotation @ np.diag([1.0, -1.0, -1.0])
-        world_to_cam = np.eye(4)
-        world_to_cam[:3, :3] = cam_to_capture.T
-        world_to_cam[:3, 3] = -cam_to_capture.T @ center
-        intrinsics = np.array([[view.fx, 0, view.cx], [0, view.fy, view.cy], [0, 0, 1]])
+        world_to_cam, intrinsics = capture_camera_matrices(view, t)
         with torch.no_grad():
             colors, _, _ = rasterization(
                 self._means,

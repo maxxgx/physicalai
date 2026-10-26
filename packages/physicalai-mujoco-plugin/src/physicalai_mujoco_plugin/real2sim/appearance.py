@@ -39,6 +39,10 @@ if TYPE_CHECKING:
 
     from physicalai_mujoco_plugin.cameras import CameraConfig
 
+_GEOM = int(mujoco.mjtObj.mjOBJ_GEOM)
+"""Segmentation object type of geoms as a plain int; comparing an array with the enum runs per element
+(about 45 ms a 640x427 frame)."""
+
 STREAM_WIDTH = 640
 """Width of a capture camera's default stream."""
 MOVED_TOLERANCE = 0.005
@@ -232,7 +236,7 @@ class Compositor:
         for geom, captured in self._objects.items():
             if np.linalg.norm(data.xpos[self._geom_body[geom]] - captured) > MOVED_TOLERANCE:
                 sim_owned[geom] = True
-        valid = (ids >= 0) & (kinds == mujoco.mjtObj.mjOBJ_GEOM)
+        valid = (ids >= 0) & (kinds == _GEOM)
         mask = np.zeros(ids.shape, dtype=bool)
         mask[valid] = sim_owned[ids[valid]]
         height, width = frame.shape[:2]

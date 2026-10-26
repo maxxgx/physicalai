@@ -21,6 +21,10 @@ import cv2
 import mujoco
 import numpy as np
 
+_GEOM = int(mujoco.mjtObj.mjOBJ_GEOM)
+"""Segmentation object type of geoms as a plain int; comparing an array with the enum runs per element
+(about 45 ms a 640x427 frame)."""
+
 
 @dataclass(frozen=True)
 class GateResult:
@@ -50,7 +54,7 @@ def _render(
         ids, kinds = np.moveaxis(renderer.render(), -1, 0)
     finally:
         renderer.close()
-    return rgb, np.where(kinds == mujoco.mjtObj.mjOBJ_GEOM, ids, -1)
+    return rgb, np.where(kinds == _GEOM, ids, -1)
 
 
 def project(points: np.ndarray, cam: dict[str, Any]) -> np.ndarray:

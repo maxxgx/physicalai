@@ -26,18 +26,20 @@ from physicalai_mujoco_plugin.real2sim.geometry import clean_points
 from physicalai_mujoco_plugin.real2sim.splats import splats_from_points
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from physicalai_mujoco_plugin.real2sim.colmap import Camera, Image, SparseModel
     from physicalai_mujoco_plugin.real2sim.geometry import SceneObject, TableScene
 
 TABLE_THICKNESS = 0.03
 HULL_VOXEL = 0.01
+"""Object points are thinned to one per voxel of this size before they become hull vertices."""
 SPLATS_FILE = "splats.npz"
 """The scene's Gaussians in the table frame, beside ``scene.xml``; the viewer draws them."""
 TABLE_COLOR_BAND = 0.005
 """Points this close to the table plane (metres) give the table its colour."""
-"""Object points are thinned to one per voxel of this size before they become hull vertices."""
+RESTING_HEIGHT = 0.05
+"""An object whose lowest point is below this (metres) rests on the table; higher ones hang."""
 
 
 @dataclass(frozen=True)
@@ -153,6 +155,8 @@ def build_spec(
     table_color: np.ndarray | None = None,
     mount: tuple[float, float, float] = (-0.30, 0.0, 0.0),
     mount_yaw_deg: float = 0.0,
+    mounts: Mapping[str, tuple[Sequence[float], float]] | None = None,
+    extra_cameras: Sequence[CaptureCamera] = (),
     free_objects: bool = True,
     object_mass: float = 0.2,
 ) -> mujoco.MjSpec:
@@ -167,7 +171,10 @@ def build_spec(
         table_color: Median RGB (0-255) of the table points, for the box colour.
         mount: ``robot_mount`` position on the table top.
         mount_yaw_deg: ``robot_mount`` yaw; 0 faces ``+x``.
-        free_objects: Objects get a free joint (pushable, graspable) instead of being fixed.
+        mounts: Several robots: ``{prefix: (position, yaw_deg)}`` gives a ``<prefix>_robot_mount``
+            frame each (``left``/``right`` for a bimanual twin) instead of ``robot_mount``.
+        extra_cameras: Cameras without a capture photo (the bench's own cameras, placed by hand).
+        free_objects: Objects get a free joint (pushable, graspable) unless they are ``fixed``.
         object_mass: Mass of each free object in kg (until measured).
 
     Returns:
@@ -206,12 +213,14 @@ def build_spec(
     )
 
     for obj in scene.objects:
-        _add_object(spec, obj, free=free_objects, mass=object_mass)
+        _add_object(spec, obj, free=free_objects and not obj.fixed, mass=object_mass)
 
-    half = math.radians(mount_yaw_deg) / 2
-    world.add_frame(name="robot_mount", pos=list(mount), quat=[math.cos(half), 0, 0, math.sin(half)])
+    frames = {"robot": (mount, mount_yaw_deg)} if mounts is None else mounts
+    for prefix, (position, yaw_deg) in frames.items():
+        half = math.radians(yaw_deg) / 2
+        world.add_frame(name=f"{prefix}_mount", pos=list(position), quat=[math.cos(half), 0, 0, math.sin(half)])
 
-    for cam in cameras:
+    for cam in [*cameras, *extra_cameras]:
         world.add_camera(
             name=cam.name,
             pos=cam.position.tolist(),
@@ -227,21 +236,41 @@ def build_spec(
 
 
 def _add_object(spec: mujoco.MjSpec, obj: SceneObject, *, free: bool, mass: float) -> None:
+    half = math.radians(obj.yaw_deg) / 2
+    body = spec.worldbody.add_body(
+        name=obj.name, pos=obj.center.tolist(), quat=[math.cos(half), 0.0, 0.0, math.sin(half)]
+    )
+    if free:
+        body.add_freejoint(name=f"{obj.name}:joint")
+    rgba = _rgba(obj.colors)
+    if obj.boxes is not None:
+        parts = len(obj.boxes)
+        for i, (x, y, z, hx, hy, hz) in enumerate(obj.boxes):
+            body.add_geom(
+                name=f"{obj.name}_geom" if i == 0 else f"{obj.name}_geom_{i}",
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                pos=[x, y, z],
+                size=[hx, hy, hz],
+                rgba=rgba,
+                mass=mass / parts if free else 0.0,
+                friction=[0.8, 0.005, 0.0001],
+            )
+        return
     vertices = _thin(obj.points, HULL_VOXEL)
     # Points just above the table were cut away as table (``min_object_height``), so the hull
     # would float and drop. Project the lowest 2 cm onto ``z = 0``: the hull rests where it stood.
-    low = vertices[vertices[:, 2] < vertices[:, 2].min() + 0.02]
-    base = np.column_stack([low[:, :2], np.zeros(len(low))])
-    vertices = np.vstack([vertices, base]) - obj.center
+    # Not for what hangs above the table (a camera bar): its hull would reach down to the table.
+    if vertices[:, 2].min() < RESTING_HEIGHT:
+        low = vertices[vertices[:, 2] < vertices[:, 2].min() + 0.02]
+        vertices = np.vstack([vertices, np.column_stack([low[:, :2], np.zeros(len(low))])])
+    c, sn = math.cos(math.radians(obj.yaw_deg)), math.sin(math.radians(obj.yaw_deg))
+    vertices = (vertices - obj.center) @ np.array([[c, -sn, 0.0], [sn, c, 0.0], [0.0, 0.0, 1.0]])
     spec.add_mesh(name=f"{obj.name}_hull", uservert=vertices.reshape(-1).tolist())
-    body = spec.worldbody.add_body(name=obj.name, pos=obj.center.tolist())
-    if free:
-        body.add_freejoint(name=f"{obj.name}:joint")
     body.add_geom(
         name=f"{obj.name}_geom",
         type=mujoco.mjtGeom.mjGEOM_MESH,
         meshname=f"{obj.name}_hull",
-        rgba=_rgba(obj.colors),
+        rgba=rgba,
         mass=mass if free else 0.0,
         friction=[0.8, 0.005, 0.0001],
     )
@@ -257,6 +286,8 @@ def write_scene(
     name: str = "real2sim",
     mount: tuple[float, float, float] = (-0.30, 0.0, 0.0),
     mount_yaw_deg: float = 0.0,
+    mounts: Mapping[str, tuple[Sequence[float], float]] | None = None,
+    extra_cameras: Sequence[CaptureCamera] = (),
     free_objects: bool = True,
     named_cameras: Mapping[str, str] | None = None,
 ) -> Path:
@@ -274,7 +305,10 @@ def write_scene(
         name: Model name.
         mount: ``robot_mount`` position on the table top.
         mount_yaw_deg: ``robot_mount`` yaw; 0 faces ``+x``.
-        free_objects: Objects get a free joint instead of being fixed.
+        mounts: Several robots, ``{prefix: (position, yaw_deg)}``: see :func:`build_spec`.
+        extra_cameras: Cameras without a capture photo: in the model, not in ``real2sim.json``
+            (the compositor gives them the splat background).
+        free_objects: Objects get a free joint unless they are ``fixed``.
         named_cameras: Sim camera name -> registered image name (e.g. ``{"overview":
             "robotcam/overview.jpg"}``: a snapshot of the bench's real camera, registered in the
             same reconstruction). Without an ``overview`` entry, the first spread camera is it.
@@ -291,7 +325,7 @@ def write_scene(
         capture_camera(f"capture_{i:02d}", image, model.cameras[image.camera_id], scene)
         for i, image in enumerate(spread)
     ]
-    if cameras and all(cam.name != "overview" for cam in cameras):
+    if cameras and all(cam.name != "overview" for cam in [*cameras, *extra_cameras]):
         cameras[0] = dataclasses.replace(cameras[0], name="overview")
     table_on = np.abs(scene.transform.apply(model.points)[:, 2]) < TABLE_COLOR_BAND
     table_color = np.median(model.colors[table_on], axis=0) if table_on.any() else None
@@ -302,6 +336,8 @@ def write_scene(
         table_color=table_color,
         mount=mount,
         mount_yaw_deg=mount_yaw_deg,
+        mounts=mounts,
+        extra_cameras=extra_cameras,
         free_objects=free_objects,
     )
     spec.compile()  # fail here, not in the plugin
@@ -314,7 +350,13 @@ def write_scene(
         "table_max": scene.table_max.tolist(),
         "floor_z": scene.floor_z,
         "objects": [
-            {"name": o.name, "center": o.center.tolist(), "size": o.size.tolist(), "points": len(o.points)}
+            {
+                "name": o.name,
+                "center": o.center.tolist(),
+                "size": o.size.tolist(),
+                "points": len(o.points),
+                "fixed": o.fixed,
+            }
             for o in scene.objects
         ],
         "cameras": [

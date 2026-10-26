@@ -27,6 +27,8 @@ _MIN_PLANE_POINTS = 3
 _MIN_FLOOR_CANDIDATES = 500
 """Fewer points below the table than this: no floor in the capture."""
 _MIN_FLOOR_INLIERS = 300
+_MIN_FIXATION_POINTS = 10
+"""Fewest central points for a photo to count in :func:`fixation_center`."""
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,14 @@ class SceneObject:
     """Footprint centre on the table (``z = 0``)."""
     size: np.ndarray
     """Axis-aligned extent ``(dx, dy, dz)`` in metres."""
+    fixed: bool = False
+    """Part of the bench (a lamp pole, a fixture): no free joint, whatever the scene's default."""
+    boxes: np.ndarray | None = None
+    """Built from boxes instead of the points' hull (a bin with dividers, a tray with rims): rows of
+    ``x, y, z, half x, half y, half z`` in the object's frame (origin at ``center``, turned by
+    ``yaw_deg``). ``points`` still feed the meta and the viewer."""
+    yaw_deg: float = 0.0
+    """The object frame's yaw about ``z`` (for ``boxes``)."""
 
 
 @dataclass(frozen=True)
@@ -131,6 +141,45 @@ def look_at_center(model: SparseModel) -> np.ndarray:
         lhs += projector
         rhs += projector @ image.center
     return np.linalg.solve(lhs, rhs)
+
+
+def fixation_center(model: SparseModel, *, window: float = 0.15) -> np.ndarray:
+    """Median of what each photo centres on: the sparse points near its image centre.
+
+    Sturdier than :func:`look_at_center` for a capture that does not orbit (a walk past the
+    bench, or a long stretch from one spot), where the optical axes are close to parallel and
+    their least-squares meeting point drifts far away.
+
+    Args:
+        model: The reconstruction.
+        window: Half-size of the central image window, as a fraction of width and height.
+
+    Returns:
+        The point in capture coordinates.
+
+    Raises:
+        ValueError: If no photo sees enough points near its centre.
+    """
+    points = model.points[clean_points(model)]
+    fixations = []
+    for image in model.images.values():
+        camera = model.cameras[image.camera_id]
+        local = (points - image.center) @ image.camera_to_world
+        ahead = local[:, 2] > 0
+        depth = np.where(ahead, local[:, 2], 1.0)
+        u = camera.fx * local[:, 0] / depth + camera.cx
+        v = camera.fy * local[:, 1] / depth + camera.cy
+        central = (
+            ahead
+            & (np.abs(u - camera.width / 2) < window * camera.width)
+            & (np.abs(v - camera.height / 2) < window * camera.height)
+        )
+        if central.sum() >= _MIN_FIXATION_POINTS:
+            fixations.append(np.median(points[central], axis=0))
+    if not fixations:
+        msg = "no photo sees enough points near its centre"
+        raise ValueError(msg)
+    return np.median(np.asarray(fixations), axis=0)
 
 
 def mean_camera_up(model: SparseModel) -> np.ndarray:
@@ -255,6 +304,9 @@ def build_table_scene(  # noqa: PLR0914
     table_margin: float = 0.02,
     voxel: float = 0.015,
     min_object_points: int = 200,
+    center: str = "look-at",
+    search_radius: float = 1.0,
+    table_points: np.ndarray | None = None,
 ) -> TableScene:
     """Find the table, the floor (optional) and the objects; return them in a metric table frame.
 
@@ -272,6 +324,13 @@ def build_table_scene(  # noqa: PLR0914
         table_margin: Objects must lie this far inside the table's edge.
         voxel: Connectivity voxel for splitting objects.
         min_object_points: Smaller clusters are noise.
+        center: ``look-at`` (where the optical axes meet: an orbit) or ``fixation`` (what the
+            photos centre on: :func:`fixation_center`, for walk-past captures).
+        search_radius: The table plane is searched within this many median camera distances of
+            the centre; smaller keeps a large room's floor out of the search.
+        table_points: Mask over ``model.points`` of points known to be on the table top (from a
+            segmentation of the photos); the plane is fitted to them alone. A white table has
+            few points of its own, so without this the plane can settle on the objects' tops.
 
     Returns:
         The table scene.
@@ -282,17 +341,19 @@ def build_table_scene(  # noqa: PLR0914
     """
     keep = clean_points(model)
     points, colors = model.points[keep], model.colors[keep]
-    center = look_at_center(model)
+    middle = fixation_center(model) if center == "fixation" else look_at_center(model)
     up = mean_camera_up(model)
-    unit = float(np.median([np.linalg.norm(im.center - center) for im in model.images.values()]))
+    unit = float(np.median([np.linalg.norm(im.center - middle) for im in model.images.values()]))
 
     # The table: the dominant up-facing plane near what the cameras look at.
-    near = np.linalg.norm(points - center, axis=1) < 1.0 * unit
+    near = np.linalg.norm(points - middle, axis=1) < search_radius * unit
+    if table_points is not None:
+        near = np.asarray(table_points)[keep]
     table_plane, _ = fit_plane(points[near], up=up, threshold=plane_threshold * unit)
     rotation = _frame(
         table_plane.normal, points[near][np.abs(table_plane.distance(points[near])) < plane_threshold * unit]
     )
-    origin = center - table_plane.distance(center[None])[0] * table_plane.normal
+    origin = middle - table_plane.distance(middle[None])[0] * table_plane.normal
 
     floor_offset = _floor_offset(points, table_plane, threshold=plane_threshold * unit, below=0.2 * unit)
 
@@ -305,7 +366,7 @@ def build_table_scene(  # noqa: PLR0914
 
     metric = transform.apply(points)
     on_table = np.abs(metric[:, 2]) < plane_threshold
-    near_metric = np.linalg.norm(metric[:, :2], axis=1) < 1.0 * unit * scale
+    near_metric = np.linalg.norm(metric[:, :2], axis=1) < search_radius * unit * scale
     table_xy = metric[on_table & near_metric, :2]
     table_min, table_max = np.percentile(table_xy, 1, axis=0), np.percentile(table_xy, 99, axis=0)
 

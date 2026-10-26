@@ -32,7 +32,7 @@ import numpy as np
 from loguru import logger
 
 from physicalai_mujoco_plugin.real2sim.geometry import Similarity
-from physicalai_mujoco_plugin.real2sim.robot_mask import environment_geoms
+from physicalai_mujoco_plugin.real2sim.robot_mask import environment_geoms, object_geoms
 from physicalai_mujoco_plugin.real2sim.splats import Splats, matrix_to_quat, read_ply_fields, viewer_subset
 
 if TYPE_CHECKING:
@@ -377,16 +377,10 @@ def load_compositors(meta_path: Path, images_dir: Path, model: mujoco.MjModel) -
         Compositors by camera name.
     """
     meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
-    environment: set[int] = set()
-    for name in ("table", "floor"):
-        geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
-        if geom >= 0:
-            environment.add(geom)
+    environment = environment_geoms(model, meta)
     objects: dict[int, np.ndarray] = {}
     for obj in meta["objects"]:
-        geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{obj['name']}_geom")
-        if geom >= 0:
-            environment.add(geom)
+        for geom in object_geoms(model, obj["name"]):
             objects[geom] = np.asarray(obj["center"], dtype=float)
     compositors = {}
     for cam in meta["cameras"]:

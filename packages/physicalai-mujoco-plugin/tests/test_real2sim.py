@@ -167,6 +167,87 @@ def test_written_scene_compiles_with_capture_cameras(tmp_path: Path) -> None:
     assert abs(uvd[0, 1] - HEIGHT / 2) < HEIGHT / 4
 
 
+def test_fixation_center_is_what_the_photos_centre_on() -> None:
+    from physicalai_mujoco_plugin.real2sim.geometry import fixation_center  # noqa: PLC0415
+
+    model = _synthetic_model()
+    rotation, offset = _capture_frame()
+
+    center = (fixation_center(model) - offset) @ rotation / CAPTURE_SCALE  # back to the table frame
+
+    assert np.linalg.norm(center[:2]) < 0.05
+    assert abs(center[2]) < 0.05
+
+
+def test_table_points_keep_the_plane_on_a_sparse_table() -> None:
+    # A dense shelf of object tops at 10 cm outvotes the sparse table: without the mask the plane
+    # lands on the shelf; the mask of segmented table points puts it back on the table.
+    model = _synthetic_model()
+    rng = np.random.default_rng(2)
+    shelf = np.column_stack([rng.uniform(-0.25, 0.25, (20000, 2)), np.full(20000, 0.1)])
+    points = np.vstack([model.points, _to_capture(shelf)])
+    model = dataclasses.replace(
+        model,
+        points=points,
+        colors=np.vstack([model.colors, np.full((len(shelf), 3), 90, np.uint8)]),
+        errors=np.full(len(points), 0.5),
+        track_lengths=np.full(len(points), 5),
+    )
+    table = np.zeros(len(points), dtype=bool)
+    table[:6000] = True  # _synthetic_model's table points come first
+    rotation, offset = _capture_frame()
+
+    def table_height(scene: object) -> float:
+        on_plane = scene.transform.apply(points[:6000])  # type: ignore[attr-defined]
+        return float(np.median(on_plane[:, 2]))
+
+    assert table_height(build_table_scene(model, scale=1 / CAPTURE_SCALE)) == pytest.approx(-0.1, abs=0.01)
+    assert table_height(build_table_scene(model, scale=1 / CAPTURE_SCALE, table_points=table)) == pytest.approx(
+        0.0, abs=0.005
+    )
+
+
+def test_two_named_mounts_fixtures_and_a_camera_without_photo(tmp_path: Path) -> None:
+    from physicalai_mujoco_plugin.real2sim.geometry import SceneObject  # noqa: PLC0415
+    from physicalai_mujoco_plugin.real2sim.robot_mask import environment_geoms  # noqa: PLC0415
+    from physicalai_mujoco_plugin.real2sim.scene_builder import CaptureCamera  # noqa: PLC0415
+
+    model = _synthetic_model()
+    scene = build_table_scene(model, scale=1 / CAPTURE_SCALE)
+    grey = np.full((8, 3), 60, np.uint8)
+    walls = np.array([[0, 0, 0.002, 0.1, 0.05, 0.002], [0, 0.048, 0.04, 0.1, 0.002, 0.04]])
+    corners = np.array([[x, y, z] for x in (-0.1, 0.1) for y in (-0.05, 0.05) for z in (0.0, 0.08)])
+    bin_ = SceneObject("bin", corners + [0.2, 0.2, 0], grey, np.array([0.2, 0.2, 0]), np.array([0.2, 0.1, 0.08]),
+                       fixed=True, boxes=walls, yaw_deg=30.0)
+    bar_points = np.array([[x, y, z] for x in (-0.3, 0.3) for y in (-0.01, 0.01) for z in (0.59, 0.61)])
+    bar = SceneObject("bar", bar_points, grey, np.array([0.0, 0.0, 0.0]), np.array([0.6, 0.02, 0.02]), fixed=True)
+    scene = dataclasses.replace(scene, objects=[*scene.objects, bin_, bar])
+    top = CaptureCamera("overview", "", 640, 480, 466.0, 466.0, 320.0, 240.0, np.array([0, 0, 0.6]), np.array([1.0, 0, 0, 0, 1, 0]))
+    mounts = {"left_robot": ((-0.2, 0.1, 0.0), 270.0), "right_robot": ((0.2, -0.1, 0.0), 270.0)}
+
+    xml = write_scene(tmp_path, model, scene, camera_count=2, mounts=mounts, extra_cameras=[top])
+
+    spec = mujoco.MjSpec.from_file(str(xml))
+    frames = {f.name: f for f in spec.frames}
+    assert set(frames) == {"left_robot_mount", "right_robot_mount"}
+    np.testing.assert_allclose(frames["right_robot_mount"].pos, [0.2, -0.1, 0.0])
+    half = math.radians(270.0) / 2
+    np.testing.assert_allclose(frames["left_robot_mount"].quat, [math.cos(half), 0, 0, math.sin(half)], atol=1e-5)
+    compiled = mujoco.MjModel.from_xml_path(str(xml))
+    assert compiled.body("bin").jntnum == 0  # fixed
+    assert compiled.body("object0").jntnum == 1  # the captured box stays free
+    assert compiled.body("bin").geomnum == len(walls)
+    meta = json.loads((tmp_path / "real2sim.json").read_text())
+    assert "overview" in [compiled.camera(i).name for i in range(compiled.ncam)]
+    assert "overview" not in [cam["name"] for cam in meta["cameras"]]  # no photo: the splat serves it
+    bin_geoms = {g for g in range(compiled.ngeom) if compiled.geom_bodyid[g] == compiled.body("bin").id}
+    assert bin_geoms <= environment_geoms(compiled, meta)
+    data = mujoco.MjData(compiled)
+    mujoco.mj_forward(compiled, data)
+    # The bar hangs at 0.6 m: its hull is not stretched down to the table (centre would be at 0.3 m).
+    assert data.geom_xpos[compiled.geom("bar_geom").id][2] == pytest.approx(0.6, abs=0.01)
+
+
 def test_object_rests_on_the_table(tmp_path: Path) -> None:
     model = _synthetic_model()
     xml = write_scene(tmp_path, model, build_table_scene(model, scale=1 / CAPTURE_SCALE), camera_count=2)

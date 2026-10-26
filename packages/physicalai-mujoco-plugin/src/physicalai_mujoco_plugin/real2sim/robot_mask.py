@@ -54,13 +54,28 @@ def robot_mask(
 
 
 def environment_geoms(model: mujoco.MjModel, meta: dict[str, object]) -> set[int]:
-    """Geoms the capture contains: the table, the floor and the captured objects.
+    """Geoms the capture contains: the table, the floor and every geom of each captured object.
 
     Returns:
         Their ids.
     """
-    names = ["table", "floor", *(f"{obj['name']}_geom" for obj in meta["objects"])]  # type: ignore[union-attr]
-    return {i for i in (mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, n) for n in names) if i >= 0}
+    found = {i for i in (mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, n) for n in ("table", "floor")) if i >= 0}
+    for obj in meta["objects"]:  # type: ignore[union-attr]
+        found |= object_geoms(model, str(obj["name"]))
+    return found
+
+
+def object_geoms(model: mujoco.MjModel, name: str) -> set[int]:
+    """The geoms of a captured object: its body's (several for a bin built from boxes).
+
+    Returns:
+        Their ids; empty if the model has no such object.
+    """
+    body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+    if body >= 0:
+        return {g for g in range(model.ngeom) if model.geom_bodyid[g] == body}
+    geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{name}_geom")
+    return {geom} if geom >= 0 else set()
 
 
 def clean_photos(

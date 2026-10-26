@@ -64,6 +64,8 @@ class ViewerService:
         self.theme: ViewerTheme = theme
         self.server: object | None = None
         self.scene: object | None = None
+        self.hidden_geom_groups: frozenset[int] = frozenset()
+        """Geom groups the 3D viewer starts with hidden (real2sim: sim geometry a captured splat shows)."""
         self.panel: SimControlPanel | None = None
         self.native: object | None = None
         self._model: object | None = None
@@ -232,6 +234,7 @@ class ViewerService:
         # stepping the same data; the sim loop re-renders at the control rate anyway.
         scene.set_refresh_handler(lambda: None)
         _cast_fixed_shadows(scene)
+        _hide_geom_groups(scene, self.hidden_geom_groups)
         state = self._panel_state()
         tabs = server.gui.add_tab_group()
         with tabs.add_tab("Simulation", icon=viser.Icon.ROBOT):
@@ -369,6 +372,21 @@ def _cast_fixed_shadows(scene: object) -> None:
     """
     for handle in (getattr(scene, "_fixed_geom_handles", None) or {}).values():
         handle.cast_shadow = True
+
+
+def _hide_geom_groups(scene: object, groups: frozenset[int]) -> None:
+    """Hide *groups* in the browser viewer before its Groups tab is built, so the tab starts unticked.
+
+    The MuJoCo renderers (camera streams) keep drawing them; only the viewer hides them.
+    """
+    visible = getattr(scene, "geom_groups_visible", None)
+    if not groups or visible is None:
+        return
+    for group in groups:
+        visible[group] = False
+    sync = getattr(scene, "_sync_visibilities", None)
+    if sync is not None:
+        sync()
 
 
 __all__ = ["ViewerService", "ViewerTheme"]

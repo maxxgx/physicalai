@@ -51,6 +51,16 @@ class Splats:
         """
         return len(self.centers)
 
+    def take(self, index: np.ndarray) -> Splats:
+        """The Gaussians at ``index``.
+
+        Returns:
+            A new :class:`Splats`.
+        """
+        return Splats(
+            self.centers[index], self.quats[index], self.scales[index], self.colors[index], self.opacities[index]
+        )
+
     def covariances(self) -> np.ndarray:
         """``R S S R^T`` per Gaussian.
 
@@ -220,6 +230,45 @@ def transform_splats(splats: Splats, transform: Similarity) -> Splats:
         colors=splats.colors,
         opacities=splats.opacities,
     )
+
+
+def viewer_subset(
+    splats: Splats,
+    table_min: np.ndarray,
+    table_max: np.ndarray,
+    *,
+    margin: float = 0.3,
+    below: float = 0.1,
+    above: float = 0.8,
+    min_opacity: float = 0.1,
+    max_scale: float = 0.1,
+    max_count: int = 1_000_000,
+) -> np.ndarray:
+    """The Gaussians worth drawing in the browser viewer (table frame).
+
+    A trained splat of a room has millions of Gaussians: about half nearly transparent, many far
+    from the bench, and floaters (large, faint ones where few photos agree). A random subset thins
+    every surface into scattered needles, and the room outside the capture orbit was seen from
+    one side only, so it smears from the viewer's angles. This keeps the visible ones near the
+    table instead:
+    within ``margin`` of it horizontally, from ``below`` under its top (the floor and legs under
+    it were barely photographed) to ``above`` over it, at least
+    ``min_opacity`` opaque and at most ``max_scale`` across; past ``max_count``, the ones that
+    cover the most (opacity times area).
+
+    Returns:
+        Sorted indices into ``splats``.
+    """
+    low = np.array([table_min[0] - margin, table_min[1] - margin, -below])
+    high = np.array([table_max[0] + margin, table_max[1] + margin, above])
+    keep = np.all((splats.centers >= low) & (splats.centers <= high), axis=1)
+    keep &= splats.opacities >= min_opacity
+    keep &= splats.scales.max(axis=1) <= max_scale
+    index = np.flatnonzero(keep)
+    if len(index) > max_count:
+        cover = splats.opacities[index] * np.prod(splats.scales[index], axis=1) ** (2 / 3)
+        index = np.sort(index[np.argpartition(cover, -max_count)[-max_count:]])
+    return index
 
 
 def splats_from_points(points: np.ndarray, colors: np.ndarray, *, sigma: float = 0.004, opacity: float = 0.9) -> Splats:

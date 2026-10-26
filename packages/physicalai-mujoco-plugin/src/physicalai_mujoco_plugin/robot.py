@@ -325,6 +325,10 @@ class MuJoCoRobot(OperatorControls):
                 panel_state=self._panel_state,
                 key_callback=self._key_callback,
             )
+            if self._appearance is not None:
+                from physicalai_mujoco_plugin.real2sim.appearance import viewer_hidden_groups  # noqa: PLC0415
+
+                self._viewer.hidden_geom_groups = viewer_hidden_groups(sim.model, self._appearance)
             if not self._viewer.open(sim.model, sim.data):
                 self._viewer, self._enable_viewer = None, False
             elif self._appearance is not None and self._viewer.server is not None:

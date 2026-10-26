@@ -32,7 +32,8 @@ import numpy as np
 from loguru import logger
 
 from physicalai_mujoco_plugin.real2sim.geometry import Similarity
-from physicalai_mujoco_plugin.real2sim.splats import matrix_to_quat, read_ply_fields
+from physicalai_mujoco_plugin.real2sim.robot_mask import environment_geoms
+from physicalai_mujoco_plugin.real2sim.splats import Splats, matrix_to_quat, read_ply_fields, viewer_subset
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -456,31 +457,49 @@ def capture_streams(meta_path: str | Path, streams: list[CameraConfig]) -> list[
     ]
 
 
-def show_splats(server: object, meta_path: str | Path, *, max_splats: int = 400_000) -> None:
+def show_splats(server: object, meta_path: str | Path, *, max_splats: int = 1_000_000) -> None:
     """Draw the scene's Gaussians (``splats.npz``) in a viser server, around the simulated robot.
 
-    The viewer shows MuJoCo's geometry too; the splats are the captured room and table around it.
-    The densest models are subsampled to ``max_splats`` to keep the browser responsive.
+    Only the visible Gaussians near the table are drawn (:func:`viewer_subset`), at most
+    ``max_splats``, to keep the browser responsive. The sim geometry they duplicate is hidden by
+    the viewer (:func:`viewer_hidden_groups`).
     """
-    from physicalai_mujoco_plugin.real2sim.splats import Splats  # noqa: PLC0415
-
     meta_path = Path(meta_path)
-    name = json.loads(meta_path.read_text(encoding="utf-8")).get("splats")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    name = meta.get("splats")
     if not name:
         return
     splats = Splats.load(meta_path.parent / name)
-    keep = np.arange(len(splats))
-    if len(keep) > max_splats:
-        keep = np.random.default_rng(0).choice(len(keep), max_splats, replace=False)
+    keep = viewer_subset(splats, np.asarray(meta["table_min"]), np.asarray(meta["table_max"]), max_count=max_splats)
+    shown = splats.take(keep)
     try:
         server.scene.add_gaussian_splats(  # type: ignore[attr-defined]
             "/real2sim/splats",
-            centers=splats.centers[keep].astype(np.float32),
-            covariances=splats.covariances()[keep].astype(np.float32),
-            rgbs=splats.colors[keep].astype(np.float32),
-            opacities=splats.opacities[keep, None].astype(np.float32),
+            centers=shown.centers.astype(np.float32),
+            covariances=shown.covariances().astype(np.float32),
+            rgbs=shown.colors.astype(np.float32),
+            opacities=shown.opacities[:, None].astype(np.float32),
         )
     except Exception as exc:  # noqa: BLE001 - the viewer is optional; the sim runs without the splats
         logger.warning("Could not show the captured splats in the viewer: {}", exc)
         return
-    logger.info("Viewer shows {} captured Gaussians from {}", len(keep), name)
+    logger.info("Viewer shows {} of {} captured Gaussians from {}", len(keep), len(splats), name)
+
+
+def viewer_hidden_groups(model: mujoco.MjModel, meta_path: str | Path) -> frozenset[int]:
+    """Geom groups the viewer hides because the captured splat already shows them.
+
+    These are the groups of the captured geometry (table, floor, objects: the sim box over the
+    real table otherwise covers it), except any group another geom (the robot) also uses. The
+    camera streams still render them: the compositor needs them for occlusion.
+
+    Returns:
+        The group numbers; empty when the scene has no splats.
+    """
+    meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+    if not meta.get("splats"):
+        return frozenset()
+    environment = environment_geoms(model, meta)
+    captured = {int(model.geom_group[g]) for g in environment}
+    shared = {int(model.geom_group[g]) for g in range(model.ngeom) if g not in environment}
+    return frozenset(captured - shared)

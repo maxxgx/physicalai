@@ -315,6 +315,41 @@ def test_splat_transform_moves_covariances_with_the_frame(tmp_path: Path) -> Non
     np.testing.assert_allclose(Splats.load(tmp_path / "s.npz").quats, moved.quats)
 
 
+def test_viewer_subset_keeps_visible_gaussians_near_the_table() -> None:
+    from physicalai_mujoco_plugin.real2sim.splats import Splats, viewer_subset  # noqa: PLC0415
+
+    centers = np.array([[0, 0, 0.05], [0, 0, 0.05], [0, 0, 0.05], [3, 0, 0], [0, 0, 0.05], [0.2, 0, 0]])
+    scales = np.full((6, 3), 0.01)
+    scales[2] = 0.5  # floater
+    scales[5] = 0.02  # covers more than the first
+    opacities = np.array([0.9, 0.02, 0.9, 0.9, 0.5, 0.9])
+    splats = Splats(centers, np.tile([1.0, 0, 0, 0], (6, 1)), scales, np.zeros((6, 3)), opacities)
+    table = (np.array([-0.3, -0.3, 0]), np.array([0.3, 0.3, 0]))
+
+    np.testing.assert_array_equal(viewer_subset(splats, *table), [0, 4, 5])  # not faint, floater, far
+    np.testing.assert_array_equal(viewer_subset(splats, *table, max_count=2), [0, 5])  # most cover
+
+
+def test_viewer_hides_only_groups_of_captured_geometry(tmp_path: Path) -> None:
+    model = _synthetic_model()
+    write_scene(tmp_path, model, build_table_scene(model, scale=1 / CAPTURE_SCALE), camera_count=1)
+    meta_path = tmp_path / "real2sim.json"
+    spec = mujoco.MjSpec.from_file(str(tmp_path / "scene.xml"))
+    robot = spec.worldbody.add_body(name="robot").add_geom(size=[0.05, 0, 0], group=1)
+    compiled = spec.compile()
+
+    assert appearance.viewer_hidden_groups(compiled, meta_path) == {0}
+    spec.geom("table").group = 1  # shared with the robot: stays visible
+    assert appearance.viewer_hidden_groups(spec.compile(), meta_path) == {0}
+    spec.geom("table").group = 0
+    robot.group = 0
+    assert appearance.viewer_hidden_groups(spec.compile(), meta_path) == set()
+    meta = json.loads(meta_path.read_text())
+    meta.pop("splats")
+    meta_path.write_text(json.dumps(meta))
+    assert appearance.viewer_hidden_groups(compiled, meta_path) == set()
+
+
 def test_read_ply_activates_3dgs_fields(tmp_path: Path) -> None:
     from physicalai_mujoco_plugin.real2sim.splats import SH_C0, read_ply  # noqa: PLC0415
 

@@ -12,6 +12,7 @@ the cameras, for the image gate and the splat renderer.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ from physicalai_mujoco_plugin.real2sim.geometry import clean_points
 from physicalai_mujoco_plugin.real2sim.splats import splats_from_points
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from physicalai_mujoco_plugin.real2sim.colmap import Camera, Image, SparseModel
     from physicalai_mujoco_plugin.real2sim.geometry import SceneObject, TableScene
 
@@ -95,6 +98,26 @@ def select_cameras(model: SparseModel, scene: TableScene, count: int) -> list[Im
     return [images[i] for i in dict.fromkeys(chosen)]
 
 
+def _named_cameras(model: SparseModel, scene: TableScene, named: Mapping[str, str]) -> list[CaptureCamera]:
+    """Capture cameras for explicitly named images, in the given order.
+
+    Returns:
+        One camera per entry.
+
+    Raises:
+        KeyError: If an image is not registered.
+    """
+    by_name = {image.name: image for image in model.images.values()}
+    cameras = []
+    for camera_name, image_name in named.items():
+        if image_name not in by_name:
+            msg = f"image {image_name!r} is not in the reconstruction (registered: {len(by_name)} images)"
+            raise KeyError(msg)
+        image = by_name[image_name]
+        cameras.append(capture_camera(camera_name, image, model.cameras[image.camera_id], scene))
+    return cameras
+
+
 def _xyaxes_quat(xyaxes: np.ndarray) -> np.ndarray:
     """Quaternion (w-first) of the frame whose x and y axes are given; z = x cross y.
 
@@ -133,11 +156,11 @@ def build_spec(
     free_objects: bool = True,
     object_mass: float = 0.2,
 ) -> mujoco.MjSpec:
-    """The scene as an :class:`mujoco.MjSpec`; ``cameras[0]`` is named ``overview``.
+    """The scene as an :class:`mujoco.MjSpec`.
 
     Args:
         scene: Table and objects in the metric table frame.
-        cameras: Capture cameras; the first becomes ``overview``, the rest keep their names.
+        cameras: Capture cameras, by their names.
         name: Model name.
         table_padding: The captured table area is usually only part of the table; extend the
             collision box by this much on every side so the robot and objects stay on it.
@@ -188,9 +211,9 @@ def build_spec(
     half = math.radians(mount_yaw_deg) / 2
     world.add_frame(name="robot_mount", pos=list(mount), quat=[math.cos(half), 0, 0, math.sin(half)])
 
-    for i, cam in enumerate(cameras):
+    for cam in cameras:
         world.add_camera(
-            name="overview" if i == 0 else cam.name,
+            name=cam.name,
             pos=cam.position.tolist(),
             quat=_xyaxes_quat(cam.xyaxes).tolist(),
             resolution=[cam.width, cam.height],
@@ -235,6 +258,7 @@ def write_scene(
     mount: tuple[float, float, float] = (-0.30, 0.0, 0.0),
     mount_yaw_deg: float = 0.0,
     free_objects: bool = True,
+    named_cameras: Mapping[str, str] | None = None,
 ) -> Path:
     """Write ``scene.xml``, ``real2sim.json``, ``points.npz`` and ``splats.npz`` into ``out_dir``.
 
@@ -251,17 +275,24 @@ def write_scene(
         mount: ``robot_mount`` position on the table top.
         mount_yaw_deg: ``robot_mount`` yaw; 0 faces ``+x``.
         free_objects: Objects get a free joint instead of being fixed.
+        named_cameras: Sim camera name -> registered image name (e.g. ``{"overview":
+            "robotcam/overview.jpg"}``: a snapshot of the bench's real camera, registered in the
+            same reconstruction). Without an ``overview`` entry, the first spread camera is it.
 
     Returns:
-        The path of ``scene.xml``.
+        The path of ``scene.xml``; a named image missing from the reconstruction raises ``KeyError``.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    images = select_cameras(model, scene, camera_count)
-    cameras = [
+    cameras = _named_cameras(model, scene, named_cameras or {})
+    named_images = {cam.image for cam in cameras}
+    spread = [image for image in select_cameras(model, scene, camera_count) if image.name not in named_images]
+    cameras += [
         capture_camera(f"capture_{i:02d}", image, model.cameras[image.camera_id], scene)
-        for i, image in enumerate(images)
+        for i, image in enumerate(spread)
     ]
+    if cameras and all(cam.name != "overview" for cam in cameras):
+        cameras[0] = dataclasses.replace(cameras[0], name="overview")
     table_on = np.abs(scene.transform.apply(model.points)[:, 2]) < TABLE_COLOR_BAND
     table_color = np.median(model.colors[table_on], axis=0) if table_on.any() else None
     spec = build_spec(
@@ -288,7 +319,7 @@ def write_scene(
         ],
         "cameras": [
             {
-                "name": "overview" if i == 0 else cam.name,
+                "name": cam.name,
                 "image": cam.image,
                 "width": cam.width,
                 "height": cam.height,
@@ -299,7 +330,7 @@ def write_scene(
                 "position": cam.position.tolist(),
                 "xyaxes": cam.xyaxes.tolist(),
             }
-            for i, cam in enumerate(cameras)
+            for cam in cameras
         ],
     }
     # Until a splat is trained (``real2sim splat``), the sparse points stand in for it in the viewer.

@@ -71,6 +71,7 @@ def _build(args: argparse.Namespace) -> int:
         mount=mount,
         mount_yaw_deg=yaw,
         free_objects=not args.static_objects,
+        named_cameras=dict(item.split("=", 1) for item in args.camera_image),
     )
     sys.stdout.write(
         f"scale {scene.transform.scale:.4f} m/unit; table {np.round(scene.table_max - scene.table_min, 3)} m\n"
@@ -133,7 +134,7 @@ def _sfm(args: argparse.Namespace) -> int:
     try:
         from physicalai_mujoco_plugin.real2sim.sfm import run_sfm  # noqa: PLC0415
 
-        result = run_sfm(Path(args.images), Path(args.out), matching=args.matching)
+        result = run_sfm(Path(args.images), Path(args.out), matching=args.matching, camera_mode=args.camera_mode)
     except ImportError:
         sys.stderr.write("sfm needs pycolmap: pip install pycolmap\n")
         return 2
@@ -194,6 +195,12 @@ def main(argv: list[str] | None = None) -> int:
     sfm.add_argument("--images", required=True, help="The photos or frames")
     sfm.add_argument("--out", required=True, help="Work directory; the result is <out>/undistorted/{images,sparse}")
     sfm.add_argument("--matching", choices=["exhaustive", "sequential"], default="exhaustive")
+    sfm.add_argument(
+        "--camera-mode",
+        choices=["single", "per_folder"],
+        default="single",
+        help="per_folder: each subfolder is its own camera (e.g. robotcam/ snapshots beside the phone frames)",
+    )
     sfm.set_defaults(run=_sfm)
 
     build = sub.add_parser("build", help="COLMAP capture -> scene.xml + real2sim.json")
@@ -218,6 +225,13 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--name", default="real2sim", help="Model name")
     build.add_argument(
         "--static-objects", action="store_true", help="Fix the objects instead of giving them free joints"
+    )
+    build.add_argument(
+        "--camera-image",
+        action="append",
+        default=[],
+        metavar="NAME=IMAGE",
+        help="Export a registered image as a named sim camera (e.g. overview=robotcam/overview.jpg); repeatable",
     )
     build.set_defaults(run=_build)
 

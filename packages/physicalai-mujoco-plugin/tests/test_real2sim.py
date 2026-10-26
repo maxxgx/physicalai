@@ -581,3 +581,17 @@ def test_splat_background_carries_moved_object_gaussians() -> None:
     np.testing.assert_allclose(background._means.numpy(), _to_capture(scene_means), atol=1e-5)  # loaded copy kept
     turned = transform.apply_rotation(quats_to_matrices(quats.numpy().astype(np.float64))[0])
     np.testing.assert_allclose(turned, turn @ transform.apply_rotation(np.eye(3)), atol=1e-5)
+
+
+def test_named_cameras_take_their_registered_image(tmp_path: Path) -> None:
+    model = _synthetic_model()
+    scene = build_table_scene(model, scale=1 / CAPTURE_SCALE)
+
+    write_scene(tmp_path, model, scene, camera_count=4, named_cameras={"overview": "005.png", "side": "002.png"})
+
+    cameras = json.loads((tmp_path / "real2sim.json").read_text())["cameras"]
+    assert [(c["name"], c["image"]) for c in cameras[:2]] == [("overview", "005.png"), ("side", "002.png")]
+    assert all(c["name"].startswith("capture_") for c in cameras[2:])
+    assert len({c["image"] for c in cameras}) == len(cameras)
+    with pytest.raises(KeyError, match="not in the reconstruction"):
+        write_scene(tmp_path / "x", model, scene, named_cameras={"overview": "nope.png"})

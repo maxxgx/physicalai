@@ -88,13 +88,16 @@ def extract_frames(video: Path, out_dir: Path, *, count: int = 150, max_side: in
     return written
 
 
-def run_sfm(images: Path, work_dir: Path, *, matching: str = "exhaustive") -> SfmResult:
+def run_sfm(images: Path, work_dir: Path, *, matching: str = "exhaustive", camera_mode: str = "single") -> SfmResult:
     """Reconstruct ``images`` with COLMAP and undistort them to one pinhole camera.
 
     Args:
         images: The photos (one phone, fixed zoom).
         work_dir: Gets ``database.db``, ``sparse/`` (raw) and ``undistorted/{images,sparse}``.
         matching: ``exhaustive`` (best for up to ~200 photos) or ``sequential`` (video order).
+        camera_mode: ``single`` (one phone) or ``per_folder``: photos in each subfolder share one
+            camera, e.g. phone frames at the top level and the bench camera's snapshots in
+            ``robotcam/``, so the robot camera gets its own intrinsics in the same reconstruction.
 
     Returns:
         The undistorted capture.
@@ -110,7 +113,8 @@ def run_sfm(images: Path, work_dir: Path, *, matching: str = "exhaustive") -> Sf
     database.unlink(missing_ok=True)
     reader = pycolmap.ImageReaderOptions()
     reader.camera_model = "OPENCV"
-    pycolmap.extract_features(database, images, camera_mode=pycolmap.CameraMode.SINGLE, reader_options=reader)
+    mode = pycolmap.CameraMode.PER_FOLDER if camera_mode == "per_folder" else pycolmap.CameraMode.SINGLE
+    pycolmap.extract_features(database, images, camera_mode=mode, reader_options=reader)
     if matching == "sequential":
         pycolmap.match_sequential(database)
     else:
@@ -124,7 +128,7 @@ def run_sfm(images: Path, work_dir: Path, *, matching: str = "exhaustive") -> Sf
     index, best = max(reconstructions.items(), key=lambda item: item[1].num_reg_images())
     undistorted = work_dir / "undistorted"
     pycolmap.undistort_images(undistorted, raw / str(index), images)
-    total = len([p for p in Path(images).iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"}])
+    total = len([p for p in Path(images).rglob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png"}])
     return SfmResult(
         images=undistorted / "images",
         sparse=undistorted / "sparse",

@@ -415,3 +415,25 @@ def test_marker_gives_scale_and_robot_mount(tmp_path: Path) -> None:
     x_axis = scene.transform.apply_rotation(marker.axes())[:, 0]
     marker_yaw = math.degrees(math.atan2(x_axis[1], x_axis[0]))
     assert yaw == pytest.approx(marker_yaw + 90.0)
+
+
+def test_extract_frames_keeps_the_sharpest_of_each_stretch(tmp_path: Path) -> None:
+    import cv2  # noqa: PLC0415
+
+    from physicalai_mujoco_plugin.real2sim.sfm import extract_frames, sharpness  # noqa: PLC0415
+
+    rng = np.random.default_rng(0)
+    sharp = rng.integers(0, 255, (120, 160, 3), dtype=np.uint8)
+    blurred = cv2.GaussianBlur(sharp, (15, 15), 5)
+    video = tmp_path / "orbit.avi"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 30, (160, 120))
+    for i in range(30):
+        writer.write(sharp if i % 3 == 1 else blurred)  # one sharp frame in every stretch of three
+    writer.release()
+
+    frames = extract_frames(video, tmp_path / "frames", count=10)
+
+    assert len(frames) == 10
+    reference = sharpness(cv2.cvtColor(cv2.imread(str(frames[0])), cv2.COLOR_BGR2GRAY))
+    assert reference > 2 * sharpness(cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY))
+    assert all(f.name == f"frame_{i:04d}.jpg" for i, f in enumerate(frames))

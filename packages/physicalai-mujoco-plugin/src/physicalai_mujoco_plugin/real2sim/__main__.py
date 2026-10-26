@@ -3,6 +3,7 @@
 
 """``python -m physicalai_mujoco_plugin.real2sim``: build a captured scene, then check it against the photos.
 
+``frames`` samples a phone video, ``sfm`` poses the photos (COLMAP, via pycolmap),
 ``build`` turns a COLMAP reconstruction and its photos into ``scene.xml`` + ``real2sim.json``;
 ``gate`` writes photo | sim | blend sheets for every capture camera and prints how well each object
 lines up; ``splat`` adds a Gaussian splat trained on the same capture (cameras without a photo, such
@@ -120,6 +121,29 @@ def _splat(args: argparse.Namespace) -> int:
     return 0
 
 
+def _frames(args: argparse.Namespace) -> int:
+    from physicalai_mujoco_plugin.real2sim.sfm import extract_frames  # noqa: PLC0415
+
+    frames = extract_frames(Path(args.video), Path(args.out), count=args.count, max_side=args.max_side)
+    sys.stdout.write(f"{len(frames)} frames in {args.out}\n")
+    return 0
+
+
+def _sfm(args: argparse.Namespace) -> int:
+    try:
+        from physicalai_mujoco_plugin.real2sim.sfm import run_sfm  # noqa: PLC0415
+
+        result = run_sfm(Path(args.images), Path(args.out), matching=args.matching)
+    except ImportError:
+        sys.stderr.write("sfm needs pycolmap: pip install pycolmap\n")
+        return 2
+    sys.stdout.write(
+        f"registered {result.registered}/{result.total} photos, {result.points} points\n"
+        f"  --sparse {result.sparse} --images {result.images}\n"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the ``build`` or ``gate`` command.
 
@@ -130,6 +154,19 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m physicalai_mujoco_plugin.real2sim", description=__doc__.split("\n")[0]
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    frames = sub.add_parser("frames", help="Phone video -> the sharpest frame of each stretch, as JPEGs")
+    frames.add_argument("--video", required=True)
+    frames.add_argument("--out", required=True, help="Directory for the frames")
+    frames.add_argument("--count", type=int, default=150, help="Frames to keep")
+    frames.add_argument("--max-side", type=int, default=1600, help="Downscale frames to this longest side")
+    frames.set_defaults(run=_frames)
+
+    sfm = sub.add_parser("sfm", help="Photos -> COLMAP poses and points, undistorted to pinhole (needs pycolmap)")
+    sfm.add_argument("--images", required=True, help="The photos or frames")
+    sfm.add_argument("--out", required=True, help="Work directory; the result is <out>/undistorted/{images,sparse}")
+    sfm.add_argument("--matching", choices=["exhaustive", "sequential"], default="exhaustive")
+    sfm.set_defaults(run=_sfm)
 
     build = sub.add_parser("build", help="COLMAP capture -> scene.xml + real2sim.json")
     build.add_argument("--sparse", required=True, help="COLMAP model directory (cameras.bin, images.bin, points3D.bin)")

@@ -183,3 +183,33 @@ def capture_streams(meta_path: str | Path, streams: list[CameraConfig]) -> list[
         else stream
         for stream in streams
     ]
+
+
+def show_splats(server: object, meta_path: str | Path, *, max_splats: int = 400_000) -> None:
+    """Draw the scene's Gaussians (``splats.npz``) in a viser server, around the simulated robot.
+
+    The viewer shows MuJoCo's geometry too; the splats are the captured room and table around it.
+    The densest models are subsampled to ``max_splats`` to keep the browser responsive.
+    """
+    from physicalai_mujoco_plugin.real2sim.splats import Splats  # noqa: PLC0415
+
+    meta_path = Path(meta_path)
+    name = json.loads(meta_path.read_text(encoding="utf-8")).get("splats")
+    if not name:
+        return
+    splats = Splats.load(meta_path.parent / name)
+    keep = np.arange(len(splats))
+    if len(keep) > max_splats:
+        keep = np.random.default_rng(0).choice(len(keep), max_splats, replace=False)
+    try:
+        server.scene.add_gaussian_splats(  # type: ignore[attr-defined]
+            "/real2sim/splats",
+            centers=splats.centers[keep].astype(np.float32),
+            covariances=splats.covariances()[keep].astype(np.float32),
+            rgbs=splats.colors[keep].astype(np.float32),
+            opacities=splats.opacities[keep, None].astype(np.float32),
+        )
+    except Exception as exc:  # noqa: BLE001 - the viewer is optional; the sim runs without the splats
+        logger.warning("Could not show the captured splats in the viewer: {}", exc)
+        return
+    logger.info("Viewer shows {} captured Gaussians from {}", len(keep), name)

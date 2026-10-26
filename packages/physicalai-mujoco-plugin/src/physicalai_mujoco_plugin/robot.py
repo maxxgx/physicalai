@@ -327,6 +327,10 @@ class MuJoCoRobot(OperatorControls):
             )
             if not self._viewer.open(sim.model, sim.data):
                 self._viewer, self._enable_viewer = None, False
+            elif self._appearance is not None and self._viewer.server is not None:
+                from physicalai_mujoco_plugin.real2sim.appearance import show_splats  # noqa: PLC0415
+
+                show_splats(self._viewer.server, self._appearance)
         self._cameras.start(sim.model, sim.data)
         self._start_http_server()
 

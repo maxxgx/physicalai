@@ -269,3 +269,48 @@ def test_capture_streams_keep_the_capture_aspect(tmp_path: Path) -> None:
 
     assert (streams[0].width, streams[0].height) == (640, 480)
     assert (streams[1].width, streams[1].height, streams[1].fps) == (640, 427, 15)
+
+
+def test_splat_transform_moves_covariances_with_the_frame(tmp_path: Path) -> None:
+    from physicalai_mujoco_plugin.real2sim.geometry import Similarity  # noqa: PLC0415
+    from physicalai_mujoco_plugin.real2sim.splats import Splats, transform_splats  # noqa: PLC0415
+
+    rng = np.random.default_rng(3)
+    quats = rng.normal(size=(5, 4))
+    splats = Splats(
+        centers=rng.normal(size=(5, 3)),
+        quats=quats / np.linalg.norm(quats, axis=1, keepdims=True),
+        scales=rng.uniform(0.01, 0.1, (5, 3)),
+        colors=rng.uniform(0, 1, (5, 3)),
+        opacities=rng.uniform(0, 1, 5),
+    )
+    rotation, offset = _capture_frame()
+    transform = Similarity(rotation, offset, 0.4)
+
+    moved = transform_splats(splats, transform)
+
+    np.testing.assert_allclose(moved.centers, transform.apply(splats.centers))
+    expected = 0.4**2 * rotation @ splats.covariances() @ rotation.T
+    np.testing.assert_allclose(moved.covariances(), expected, atol=1e-12)
+    moved.save(tmp_path / "s.npz")
+    np.testing.assert_allclose(Splats.load(tmp_path / "s.npz").quats, moved.quats)
+
+
+def test_read_ply_activates_3dgs_fields(tmp_path: Path) -> None:
+    from physicalai_mujoco_plugin.real2sim.splats import SH_C0, read_ply  # noqa: PLC0415
+
+    fields = ["x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1", "scale_2"]
+    fields += ["rot_0", "rot_1", "rot_2", "rot_3"]
+    values = np.array([[1, 2, 3, 0, 1 / SH_C0 * 0.25, -1, 0, np.log(0.02), np.log(0.03), np.log(0.04), 2, 0, 0, 0]])
+    header = "ply\nformat binary_little_endian 1.0\nelement vertex 1\n"
+    header += "".join(f"property float {name}\n" for name in fields) + "end_header\n"
+    path = tmp_path / "point_cloud.ply"
+    path.write_bytes(header.encode() + values.astype("<f4").tobytes())
+
+    splats = read_ply(path)
+
+    np.testing.assert_allclose(splats.centers, [[1, 2, 3]])
+    np.testing.assert_allclose(splats.colors, [[0.5, 0.75, 0.5 - SH_C0]], atol=1e-6)
+    np.testing.assert_allclose(splats.opacities, [0.5])
+    np.testing.assert_allclose(splats.scales, [[0.02, 0.03, 0.04]], rtol=1e-6)
+    np.testing.assert_allclose(splats.quats, [[1, 0, 0, 0]])

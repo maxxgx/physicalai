@@ -21,12 +21,17 @@ from typing import TYPE_CHECKING
 import mujoco
 import numpy as np
 
+from physicalai_mujoco_plugin.real2sim.geometry import clean_points
+from physicalai_mujoco_plugin.real2sim.splats import splats_from_points
+
 if TYPE_CHECKING:
     from physicalai_mujoco_plugin.real2sim.colmap import Camera, Image, SparseModel
     from physicalai_mujoco_plugin.real2sim.geometry import SceneObject, TableScene
 
 TABLE_THICKNESS = 0.03
 HULL_VOXEL = 0.01
+SPLATS_FILE = "splats.npz"
+"""The scene's Gaussians in the table frame, beside ``scene.xml``; the viewer draws them."""
 TABLE_COLOR_BAND = 0.005
 """Points this close to the table plane (metres) give the table its colour."""
 """Object points are thinned to one per voxel of this size before they become hull vertices."""
@@ -231,7 +236,7 @@ def write_scene(
     mount_yaw_deg: float = 0.0,
     free_objects: bool = True,
 ) -> Path:
-    """Write ``scene.xml``, ``real2sim.json`` and ``points.npz`` into ``out_dir``; return the XML path.
+    """Write ``scene.xml``, ``real2sim.json``, ``points.npz`` and ``splats.npz`` into ``out_dir``.
 
     Capture cameras are scaled to the photos' resolution by the caller (``model.cameras`` must
     describe the images the gate will compare against).
@@ -297,6 +302,10 @@ def write_scene(
             for i, cam in enumerate(cameras)
         ],
     }
+    # Until a splat is trained (``real2sim splat``), the sparse points stand in for it in the viewer.
+    keep = clean_points(model)
+    splats_from_points(scene.transform.apply(model.points[keep]), model.colors[keep]).save(out_dir / SPLATS_FILE)
+    meta["splats"] = SPLATS_FILE
     (out_dir / "real2sim.json").write_text(json.dumps(meta, indent=2))
     np.savez_compressed(
         out_dir / "points.npz",

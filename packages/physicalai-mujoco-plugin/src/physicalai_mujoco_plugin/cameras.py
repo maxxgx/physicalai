@@ -27,7 +27,12 @@ from loguru import logger
 from physicalai_mujoco_plugin.camera_thread import CameraThread, RateMeter
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
     from physicalai_mujoco_plugin.http_server import FrameBuffer
+
+    Compositor = Callable[..., np.ndarray]
+    """``(renderer, data, camera, frame) -> frame``: replaces a rendered frame (real2sim appearance)."""
 
 GL_PROBE_TIMEOUT_S = 10.0
 """How long the rendering probe may take; a host without a usable GL backend can hang instead of failing."""
@@ -152,6 +157,9 @@ class CameraService:
         self._last_frame_ts: dict[str, float] = {}
         self._thread: CameraThread | None = None
         self._data: object | None = None
+        self.compositor_factory: Callable[..., Mapping[str, Compositor]] | None = None
+        """Builds per-camera compositors for each model the service starts on; ``None`` keeps MuJoCo's frames."""
+        self._compositors: Mapping[str, Compositor] = {}
 
     @property
     def renderers(self) -> dict[str, object]:
@@ -206,6 +214,7 @@ class CameraService:
             del self.frame_buffers[name]  # a camera of the previous model; the HTTP server shares this dict
         if not self.configs:
             return
+        self._compositors = self.compositor_factory(model) if self.compositor_factory is not None else {}
         for config in self.configs:
             if config.name not in self.frame_buffers:
                 from physicalai_mujoco_plugin.http_server import FrameBuffer  # noqa: PLC0415
@@ -295,6 +304,9 @@ class CameraService:
                 # mujoco.Renderer already returns the image upright (it flips the
                 # OpenGL read-back itself), so the frame is used as rendered.
                 frame = renderer.render()[:, :, :3]
+                compositor = self._compositors.get(config.name)
+                if compositor is not None:
+                    frame = compositor(renderer, data, config.name, frame)
             except (RuntimeError, ValueError) as exc:
                 logger.debug("Camera render error for '{}': {}", config.name, exc)
                 continue

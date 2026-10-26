@@ -107,6 +107,7 @@ class MuJoCoRobot(OperatorControls):
         studio_url: str = DEFAULT_STUDIO_URL,
         seed: int | None = None,
         exit_with_pid: int | None = None,
+        appearance: str | None = None,
     ) -> None:
         """Create a disconnected simulation.
 
@@ -142,6 +143,9 @@ class MuJoCoRobot(OperatorControls):
             exit_with_pid: The PID of the process that starts this owner, its parent: once this
                 process is no longer its child, the shared owner shuts down as on ``POST /shutdown``.
                 ``physicalai-mujoco start --exit-with-parent`` passes its own PID.
+            appearance: A real2sim ``real2sim.json`` (written next to a captured scene's XML): its
+                capture cameras show the captured environment behind the simulated robot instead of
+                MuJoCo's rendering of it.
 
         Raises:
             ValueError: If ``unit``, ``torque_mode``, ``rate_hz``, ``substeps``, ``overview``,
@@ -172,7 +176,7 @@ class MuJoCoRobot(OperatorControls):
             "torque_mode": torque_mode, "substeps": substeps, "rate_hz": rate_hz, "cameras": cameras,
             "overview": overview, "enable_viewer": enable_viewer, "viser_host": viser_host, "viser_port": viser_port,
             "viewer_theme": viewer_theme, "http_host": http_host, "http_port": http_port, "owner_name": owner_name,
-            "studio_url": studio_url, "seed": seed, "exit_with_pid": exit_with_pid,
+            "studio_url": studio_url, "seed": seed, "exit_with_pid": exit_with_pid, "appearance": appearance,
         }  # fmt: skip
         """Constructor arguments, for pickling (``__getstate__``)."""
         self._profile: RobotProfile = get_profile(profile)
@@ -209,6 +213,10 @@ class MuJoCoRobot(OperatorControls):
         )
         self._objects = SceneObjects(self._area, self._state_lock)
         self._cameras = CameraService(self._camera_arg or [])
+        if appearance is not None:
+            from physicalai_mujoco_plugin.real2sim.appearance import compositor_factory  # noqa: PLC0415
+
+            self._cameras.compositor_factory = compositor_factory(appearance)
         self._viewer: ViewerService | None = None
         self._http_server: HttpServer | None = None
         self._watcher: SceneXmlWatcher | None = None

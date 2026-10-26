@@ -203,8 +203,12 @@ class _FakeSegmentationRenderer:
 
 
 class _FlatBackground:
-    def frame(self, width: int, height: int) -> np.ndarray:
-        return np.full((height, width, 3), 7, dtype=np.uint8)
+    def __init__(self) -> None:
+        self.views: list[appearance.View] = []
+
+    def frame(self, view: appearance.View) -> np.ndarray:
+        self.views.append(view)
+        return np.full((view.height, view.width, 3), 7, dtype=np.uint8)
 
 
 def test_compositor_keeps_the_robot_and_moved_objects_from_the_sim() -> None:
@@ -212,6 +216,7 @@ def test_compositor_keeps_the_robot_and_moved_objects_from_the_sim() -> None:
       <geom name="table" type="box" size="1 1 0.01"/>
       <body name="object0" pos="0 0 0.1"><freejoint/><geom name="object0_geom" type="box" size="0.05 0.05 0.05"/></body>
       <body name="link"><geom name="robot_link" type="sphere" size="0.05" pos="0.5 0 0.5"/></body>
+      <camera name="cam" pos="0 -1 0.5" fovy="60"/>
     </worldbody></mujoco>"""
     model = mujoco.MjModel.from_xml_string(xml)
     data = mujoco.MjData(model)
@@ -219,12 +224,16 @@ def test_compositor_keeps_the_robot_and_moved_objects_from_the_sim() -> None:
     table, obj, link = (model.geom(n).id for n in ("table", "object0_geom", "robot_link"))
     ids = np.array([[table, obj, link, -1]])
     frame = np.full((1, 4, 3), 200, dtype=np.uint8)
-    compositor = appearance.Compositor(model, _FlatBackground(), {table, obj}, {obj: np.array([0.0, 0.0, 0.1])})
+    background = _FlatBackground()
+    compositor = appearance.Compositor(model, background, {table, obj}, {obj: np.array([0.0, 0.0, 0.1])})
     renderer = _FakeSegmentationRenderer(ids)
 
     out = compositor(renderer, data, "cam", frame)
     np.testing.assert_array_equal(out[0, :, 0], [7, 7, 200, 7])  # only the robot comes from the sim
     assert not renderer.segmentation
+    view = background.views[-1]
+    assert (view.width, view.height, view.cx) == (4, 1, 2.0)
+    np.testing.assert_allclose(view.position, [0, -1, 0.5])
 
     data.qpos[0] += 0.05  # the object was pushed
     mujoco.mj_forward(model, data)
@@ -314,3 +323,35 @@ def test_read_ply_activates_3dgs_fields(tmp_path: Path) -> None:
     np.testing.assert_allclose(splats.opacities, [0.5])
     np.testing.assert_allclose(splats.scales, [[0.02, 0.03, 0.04]], rtol=1e-6)
     np.testing.assert_allclose(splats.quats, [[1, 0, 0, 0]])
+
+
+def test_camera_view_matches_the_capture_intrinsics(tmp_path: Path) -> None:
+    model = _synthetic_model()
+    xml = write_scene(tmp_path, model, build_table_scene(model, scale=1 / CAPTURE_SCALE), camera_count=2)
+    compiled = mujoco.MjModel.from_xml_path(str(xml))
+    data = mujoco.MjData(compiled)
+    mujoco.mj_forward(compiled, data)
+    cam = json.loads((tmp_path / "real2sim.json").read_text())["cameras"][0]
+
+    view = appearance.camera_view(compiled, data, compiled.camera("overview").id, WIDTH // 2, HEIGHT // 2)
+
+    assert (view.fx, view.fy) == pytest.approx((cam["fx"] / 2, cam["fy"] / 2))
+    assert (view.cx, view.cy) == pytest.approx((cam["cx"] / 2, cam["cy"] / 2))
+    np.testing.assert_allclose(view.position, cam["position"], atol=1e-6)  # XML keeps 6 digits
+    np.testing.assert_allclose(view.rotation[:, 0], cam["xyaxes"][:3], atol=1e-5)
+    np.testing.assert_allclose(view.rotation[:, 1], cam["xyaxes"][3:], atol=1e-5)
+
+
+def test_splat_background_is_skipped_without_gsplat() -> None:
+    try:
+        import gsplat  # noqa: F401, PLC0415
+        import torch  # noqa: PLC0415
+    except ImportError:
+        pass
+    else:
+        if torch.cuda.is_available():
+            pytest.skip("gsplat and a GPU are present")
+    meta = {"splat_ply": "missing.ply", "transform": {"rotation": np.eye(3).tolist(), "origin": [0, 0, 0], "scale": 1.0}}
+
+    assert appearance._splat_background(meta) is None
+    assert appearance._splat_background({"transform": meta["transform"]}) is None

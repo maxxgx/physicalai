@@ -5,7 +5,8 @@
 
 ``build`` turns a COLMAP reconstruction and its photos into ``scene.xml`` + ``real2sim.json``;
 ``gate`` writes photo | sim | blend sheets for every capture camera and prints how well each object
-lines up. Run the result with::
+lines up; ``splat`` adds a Gaussian splat trained on the same capture (cameras without a photo, such
+as the wrist, then render it on a CUDA host). Run the result with::
 
     physicalai-mujoco start --profile trossen_wxai --model <out>/scene.xml --appearance <out>/real2sim.json
 """
@@ -85,6 +86,23 @@ def _gate(args: argparse.Namespace) -> int:
     return 0 if worst >= args.min_coverage else 1
 
 
+def _splat(args: argparse.Namespace) -> int:
+    from physicalai_mujoco_plugin.real2sim.geometry import Similarity  # noqa: PLC0415
+    from physicalai_mujoco_plugin.real2sim.splats import read_ply, transform_splats  # noqa: PLC0415
+
+    scene_dir = Path(args.scene)
+    meta_path = scene_dir / "real2sim.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    ply = Path(args.ply).resolve()
+    splats = transform_splats(read_ply(ply), Similarity.from_dict(meta["transform"]))
+    splats.save(scene_dir / "splats.npz")
+    meta["splats"] = "splats.npz"
+    meta["splat_ply"] = str(ply)
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    sys.stdout.write(f"{len(splats)} Gaussians from {ply} -> {scene_dir / 'splats.npz'}\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the ``build`` or ``gate`` command.
 
@@ -117,6 +135,13 @@ def main(argv: list[str] | None = None) -> int:
     gate.add_argument("--out", default=None, help="Sheet directory (default: <scene>/gate)")
     gate.add_argument("--min-coverage", type=float, default=0.9, help="Fail below this object coverage")
     gate.set_defaults(run=_gate)
+
+    splat = sub.add_parser("splat", help="Use a trained 3DGS .ply (capture frame) as the scene's appearance")
+    splat.add_argument("--scene", required=True, help="Directory written by build")
+    splat.add_argument(
+        "--ply", required=True, help="Trained splat (gsplat / nerfstudio / brush export) on the same capture"
+    )
+    splat.set_defaults(run=_splat)
 
     args = parser.parse_args(argv)
     return args.run(args)

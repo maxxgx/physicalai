@@ -144,11 +144,12 @@ def quat_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     )
 
 
-def read_ply(path: Path) -> Splats:
-    """Read a 3DGS ``.ply`` (binary little-endian; ``x y z f_dc_* opacity scale_* rot_*``).
+def read_ply_fields(path: Path) -> dict[str, np.ndarray]:
+    """Read a 3DGS ``.ply`` (binary little-endian; ``x y z f_dc_* f_rest_* opacity scale_* rot_*``) raw.
 
     Returns:
-        The splats in the capture frame, with activated scales, opacities and colours.
+        ``means`` ``(N, 3)``, unit w-first ``quats`` ``(N, 4)``, ``log_scales`` ``(N, 3)``,
+        ``opacity_logits`` ``(N,)`` and spherical harmonics ``sh`` ``(N, K, 3)`` (``K = (degree + 1)²``).
 
     Raises:
         ValueError: If the file is not a binary little-endian vertex list with the 3DGS fields.
@@ -173,15 +174,35 @@ def read_ply(path: Path) -> Splats:
     if not needed <= set(names):
         msg = f"{path}: missing 3DGS fields {sorted(needed - set(names))}"
         raise ValueError(msg)
-    centers = np.column_stack([table["x"], table["y"], table["z"]]).astype(np.float64)
-    dc = np.column_stack([table[f"f_dc_{i}"] for i in range(3)])
+    dc = np.column_stack([table[f"f_dc_{i}"] for i in range(3)]).astype(np.float64)
+    rest_names = sorted((n for n in names if n.startswith("f_rest_")), key=lambda n: int(n.rsplit("_", 1)[1]))
+    # INRIA stores the higher bands channel-major: f_rest = [R coeffs..., G coeffs..., B coeffs...].
+    rest = (
+        np.column_stack([table[n] for n in rest_names]).reshape(count, 3, -1) if rest_names else np.zeros((count, 3, 0))
+    )
     quats = np.column_stack([table[f"rot_{i}"] for i in range(4)]).astype(np.float64)
+    return {
+        "means": np.column_stack([table["x"], table["y"], table["z"]]).astype(np.float64),
+        "quats": quats / np.linalg.norm(quats, axis=1, keepdims=True),
+        "log_scales": np.column_stack([table[f"scale_{i}"] for i in range(3)]).astype(np.float64),
+        "opacity_logits": table["opacity"].astype(np.float64),
+        "sh": np.concatenate([dc[:, None, :], np.swapaxes(rest, 1, 2).astype(np.float64)], axis=1),
+    }
+
+
+def read_ply(path: Path) -> Splats:
+    """Read a 3DGS ``.ply`` with activated scales, opacities and view-independent colours.
+
+    Returns:
+        The splats in the capture frame.
+    """
+    fields = read_ply_fields(path)
     return Splats(
-        centers=centers,
-        quats=quats / np.linalg.norm(quats, axis=1, keepdims=True),
-        scales=np.exp(np.column_stack([table[f"scale_{i}"] for i in range(3)])).astype(np.float64),
-        colors=np.clip(0.5 + SH_C0 * dc, 0.0, 1.0),
-        opacities=1.0 / (1.0 + np.exp(-table["opacity"].astype(np.float64))),
+        centers=fields["means"],
+        quats=fields["quats"],
+        scales=np.exp(fields["log_scales"]),
+        colors=np.clip(0.5 + SH_C0 * fields["sh"][:, 0, :], 0.0, 1.0),
+        opacities=1.0 / (1.0 + np.exp(-fields["opacity_logits"])),
     )
 
 

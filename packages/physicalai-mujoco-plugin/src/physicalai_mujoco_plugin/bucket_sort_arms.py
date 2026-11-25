@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from math import pi, radians
 
-from physicalai_mujoco_plugin.bucket_sort import TaskLayout
+from physicalai_mujoco_plugin.bucket_sort import Pose2D, TaskLayout
 
 FRANKA_GRIP_OPEN = 0.08
 """The Franka Hand's full opening, in metres."""
@@ -302,6 +302,29 @@ SIX_JOINT_LAYOUT = TaskLayout(
 them nearly straight down, and the buckets 0.28 to 0.60 m (the release points), where the hand
 reaches over their rims leaning outward. The buckets' open ends face the base. Full size, the
 scene's table; the hands' footprints are the grippers' (camera mount included)."""
+REBOT_DESK_ROW = (
+    ("black", Pose2D(0.5264, -0.2171, 1.1750)),
+    ("green", Pose2D(0.5639, -0.0618, 1.4027)),
+    ("red", Pose2D(0.5651, 0.0967, 1.6697)),
+    ("blue", Pose2D(0.5345, 0.2656, 1.8072)),
+)
+"""The real reBot desk's buckets, right to left as seen from behind the robot (``bucket_sort_desk``): centres and
+headings measured from a phone scan of the desk (real2sim calibration), the open ends facing the base."""
+REBOT_DESK_LAYOUT = replace(
+    SIX_JOINT_LAYOUT,
+    row=REBOT_DESK_ROW,
+    row_jitter=(0.015, 0.015, radians(6.0)),
+    bucket_reach=(0.28, 0.68),
+    bucket_gap=0.0,
+    table_x=(-0.07, 0.72),
+    table_y=(-0.80, 0.75),
+    fill=(0.0, 1.0),
+    reach=(0.29, 0.42),
+)
+"""The reBot on the real desk: the measured bucket row, each bucket moved up to 1.5 cm and turned up to 6 degrees
+at each reset, the objects where :data:`SIX_JOINT_LAYOUT` puts them but at least 0.29 m from the base (the 1 cm
+base plate puts nearer grasps beyond the hand's 15 degree lean), and each bucket's contents from empty to full. The real buckets stand nearly touching and
+up to 0.62 m from the base, so the gap and the bucket reach are those of the measured row."""
 WXAI_PAIR_SEPARATION = 0.44
 """Two WidowX AI stand this far apart at the table edge, side by side."""
 WXAI_PAIR_TURN = radians(30.0)
@@ -365,6 +388,8 @@ __all__ = [
     "FRANKA_GRIP_OPEN",
     "PANDA_ARM",
     "REBOT_ARM",
+    "REBOT_DESK_LAYOUT",
+    "REBOT_DESK_ROW",
     "SIX_JOINT_LAYOUT",
     "WXAI_ARM",
     "WXAI_PAIR_LAYOUT",

@@ -51,6 +51,10 @@ class ChannelOverride:
     velocity_unit: Literal["public", "model"] = "public"
 
 
+Vec3 = tuple[float, float, float]
+Rgba = tuple[float, float, float, float]
+
+
 @dataclass(frozen=True)
 class CameraSpec:
     """A robot camera: its unprefixed public name and its pose in a robot body.
@@ -68,6 +72,15 @@ class CameraSpec:
     fovy: float
     """Vertical field of view in degrees."""
     source: CameraSource = "override"
+    housing: tuple[float, float, float] | None = None
+    """Half sizes (x, y, depth) in metres of the camera's body, drawn as a visual box behind its front face
+    (the camera frame's origin), so that other cameras see it; ``None`` draws nothing."""
+    mount: tuple[Vec3, Vec3, Rgba] | None = None
+    """The camera's bracket as a visual box: centre and half sizes in the parent body's frame (axis-aligned), and
+    its colour; ``None`` draws nothing."""
+    mount_hull: tuple[tuple[Vec3, ...], Rgba] | None = None
+    """The camera's bracket as a visual convex hull: its vertices in the parent body's frame, and its colour; it
+    replaces :attr:`mount` when both are given."""
 
 
 @dataclass(frozen=True)

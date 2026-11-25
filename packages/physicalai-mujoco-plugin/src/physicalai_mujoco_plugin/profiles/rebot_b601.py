@@ -70,9 +70,54 @@ REBOT_B601_WRIST_CAMERA = CameraSpec(
     # The D405's front face centre: 104 mm off the roll axis (link6 +z), 39 mm along it. The camera
     # looks along (-0.5, 0, 0.866) in link6, toward the axis and the fingers, with image up along
     # (0.866, 0, 0.5), away from the gripper; its x axis is link6 +y.
-    pos=(0.10414, 0.0, 0.03915),
+    # Measured on the real arm (phone scan, the lens midpoint triangulated in three views, 2-5 px reprojection): 21 mm
+    # further along the roll axis than the mount STEP's (0.10414, 0, 0.03915).
+    pos=(0.1017, 0.0031, 0.0602),
     quat=(0.18301270189221933, 0.6830127018922193, 0.6830127018922193, 0.18301270189221933),
     fovy=58.0,  # the D405's vertical field of view
+    housing=(0.021, 0.021, 0.0115),  # the D405's 42 x 42 x 23 mm body
+    # The printed brown shroud and bracket around the camera, measured on the real arm: the convex hull of its
+    # Gaussians in a phone scan (link6 frame, outliers beyond 1.8 sigma left out; about 10 x 6 x 5 cm).
+    mount_hull=(
+        (
+            (0.0341, 0.0125, 0.0860),
+            (0.0114, -0.0223, 0.0723),
+            (0.1008, 0.0213, 0.0482),
+            (0.0288, -0.0139, 0.0838),
+            (0.0533, 0.0194, 0.0453),
+            (0.0048, 0.0379, 0.0807),
+            (0.0413, -0.0170, 0.0540),
+            (0.0356, -0.0174, 0.0775),
+            (0.0497, 0.0053, 0.0446),
+            (0.0007, -0.0194, 0.0802),
+            (0.0131, -0.0191, 0.0687),
+            (0.0111, 0.0301, 0.0895),
+            (0.0000, 0.0316, 0.0720),
+            (-0.0072, 0.0227, 0.0796),
+            (0.0004, 0.0375, 0.0784),
+            (0.0364, -0.0097, 0.0832),
+            (0.0026, 0.0218, 0.0909),
+            (-0.0065, 0.0360, 0.0856),
+            (0.1008, 0.0191, 0.0528),
+            (0.0121, 0.0253, 0.0910),
+            (0.1120, 0.0171, 0.0421),
+            (0.0101, -0.0177, 0.0699),
+            (0.0953, 0.0234, 0.0399),
+            (0.0794, 0.0148, 0.0383),
+            (0.0145, 0.0167, 0.0925),
+            (0.0652, -0.0084, 0.0467),
+            (0.0115, -0.0155, 0.0858),
+            (0.0030, 0.0271, 0.0684),
+            (0.0809, 0.0191, 0.0402),
+            (0.0105, -0.0220, 0.0809),
+            (0.0119, 0.0392, 0.0773),
+            (0.0082, -0.0216, 0.0741),
+            (0.1054, -0.0009, 0.0404),
+            (0.0245, -0.0156, 0.0834),
+            (0.0098, -0.0222, 0.0807),
+        ),
+        (0.36, 0.20, 0.12, 1.0),
+    ),
 )
 """The wrist D405 on Seeed's ``D405_305_Mount``, from the mount's STEP geometry; the side is assumed."""
 

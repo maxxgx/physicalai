@@ -50,6 +50,11 @@ BUCKET_JOINTS = tuple(f"bucket_{color}:joint" for color in BUCKET_COLORS)
 """The buckets' free joints, in :data:`BUCKET_COLORS` order."""
 ALL_PAIRS: tuple[tuple[str, str], ...] = tuple((obj, color) for obj in OBJECTS for color in BUCKET_COLORS)
 """Every (object, bucket colour) pair an instruction can name."""
+KNOWN_BUCKET_COLORS = (*BUCKET_COLORS, "green")
+"""Every colour a scene's bucket may have. ``bucket_sort`` has :data:`BUCKET_COLORS`; a scene with other
+buckets (``bucket_sort_desk``'s four) is read from its model (:func:`bucket_colors`)."""
+NUMBER_WORDS = {2: "two", 3: "three", 4: "four", 5: "five"}
+"""How an instruction counts the buckets ("of the four bins, ...")."""
 
 BUCKET_SIZE = (0.150, 0.2025, 0.120)
 """The bucket's outer size in its own frame, in metres: across (x), long axis (y) and depth (z).
@@ -267,6 +272,25 @@ class TaskLayout:
     """Distance from an arm's base axis at which it reaches every object centre."""
     bucket_reach: tuple[float, float] = REACH_RADIUS
     """Distance from an arm's base axis at which it reaches every point of :data:`BUCKET_REACH_POINTS`."""
+    row: tuple[tuple[str, Pose2D], ...] = ()
+    """A row of buckets measured on a real setup: each colour with its pose (yaw included). A reset
+    moves each by up to :attr:`row_jitter` and, with :attr:`shuffle_row`, deals the colours to the
+    row's places at random; empty draws the buckets anywhere in :attr:`bucket_x` and :attr:`bucket_y`."""
+    row_jitter: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Largest move of a row bucket from its place: along x and y (metres) and its turn (radians)."""
+    shuffle_row: bool = False
+    """Deal the row's colours to its places at random at each reset."""
+    table_x: tuple[float, float] | None = None
+    """The table top's extent along x; ``None`` for :data:`TABLE_X`."""
+    table_y: tuple[float, float] | None = None
+    """The table top's extent along y; ``None`` for :data:`TABLE_Y`."""
+    bucket_gap: float | None = None
+    """Least gap between two buckets; ``None`` for :data:`BUCKET_GAP`. A real row can stand closer."""
+    fill: tuple[float, float] | None = None
+    """How full each bucket's contents are at a reset, a fraction drawn per bucket from this range; ``None``
+    leaves them as the scene wrote them. The contents are geoms of the bucket body named
+    ``bucket_<colour>_item<k>`` (collision) and ``bucket_<colour>_item<k>_<part>`` (visual), the lowest first;
+    a lower fill hides the top ones (:func:`set_bucket_fill`)."""
     bases: tuple[tuple[float, float], ...] = ((0.0, 0.0),)
     """The arms' base axes on the table; an object or bucket point must be in reach of one of them."""
     hand_half_size: tuple[float, float] = HAND_HALF_SIZE
@@ -368,7 +392,8 @@ def bucket_problems(
     """
     problems: list[str] = []
     corners = bucket_footprint(pose)
-    (x_lo, x_hi), (y_lo, y_hi) = TABLE_X, TABLE_Y
+    layout = _current(layout)
+    (x_lo, x_hi), (y_lo, y_hi) = layout.table_x or TABLE_X, layout.table_y or TABLE_Y
     if (
         corners[:, 0].min() < x_lo + TABLE_MARGIN
         or corners[:, 0].max() > x_hi - TABLE_MARGIN
@@ -378,17 +403,17 @@ def bucket_problems(
         problems.append("table edge")
         if first:
             return problems
-    layout = _current(layout)
     turn = _rotation(pose.yaw)
     points = [np.array([pose.x, pose.y]) + turn @ point for point in BUCKET_REACH_POINTS]
     if not all(_in_reach(float(x), float(y), layout.bucket_reach, layout.bases) for x, y in points):
         problems.append("reach")
         if first:
             return problems
+    gap = BUCKET_GAP if layout.bucket_gap is None else layout.bucket_gap
     for other in others:
-        if _far_apart((pose.x, pose.y), (other.x, other.y), 2.0 * _BUCKET_RADIUS + BUCKET_GAP):
+        if _far_apart((pose.x, pose.y), (other.x, other.y), 2.0 * _BUCKET_RADIUS + gap):
             continue
-        if polygon_gap(corners, bucket_footprint(other)) < BUCKET_GAP:
+        if polygon_gap(corners, bucket_footprint(other)) < gap:
             problems.append("bucket gap")
             break
     return problems
@@ -469,8 +494,32 @@ def object_problems(
     return sorted(problems)
 
 
+def _draw_bucket(rng: np.random.Generator, layout: TaskLayout, place: Pose2D | None) -> Pose2D:
+    """Draw a bucket pose: near its row *place*, or anywhere in the layout's bucket area.
+
+    Returns:
+        The pose.
+    """
+    if place is not None:
+        dx, dy, dyaw = layout.row_jitter
+        return Pose2D(
+            place.x + float(rng.uniform(-dx, dx)),
+            place.y + float(rng.uniform(-dy, dy)),
+            place.yaw + float(rng.uniform(-dyaw, dyaw)),
+        )
+    x, y = float(rng.uniform(*layout.bucket_x)), float(rng.uniform(*layout.bucket_y))
+    yaw = BUCKET_YAW
+    if layout.face_bases:
+        base_x, base_y = layout.nearest_base(x, y)
+        yaw += float(np.arctan2(y - base_y, x - base_x))
+    return Pose2D(x, y, yaw + float(rng.uniform(-BUCKET_YAW_RANGE, BUCKET_YAW_RANGE)))
+
+
 def sample_layout(
-    rng: np.random.Generator, footprints: Mapping[str, ObjectFootprint], layout: TaskLayout = DEFAULT_LAYOUT
+    rng: np.random.Generator,
+    footprints: Mapping[str, ObjectFootprint],
+    layout: TaskLayout = DEFAULT_LAYOUT,
+    colors: tuple[str, ...] = BUCKET_COLORS,
 ) -> Layout:
     """Draw a layout of the buckets and the objects that passes every check.
 
@@ -482,33 +531,35 @@ def sample_layout(
     Args:
         rng: The generator.
         footprints: Each object's :class:`ObjectFootprint` (:func:`object_footprint`).
-        layout: Where the robot's buckets and objects may stand.
+        layout: Where the robot's buckets and objects may stand; with a :attr:`TaskLayout.row`, the
+            buckets stand in that row instead.
+        colors: The colours of the scene's buckets (:func:`bucket_colors`); a row names its own.
 
     Returns:
-        The layout; :data:`FALLBACK_LAYOUT` when :data:`LAYOUT_RESTARTS` layouts all failed.
+        The layout; :data:`FALLBACK_LAYOUT` (or the row as measured) when :data:`LAYOUT_RESTARTS`
+        layouts all failed.
     """
     draws = 0
     default = layout is DEFAULT_LAYOUT
     layout = _current(layout)
+    colors = tuple(color for color, _ in layout.row) or colors
     for _ in range(LAYOUT_RESTARTS):
         buckets: dict[str, Pose2D] = {}
-        for index in rng.permutation(len(BUCKET_COLORS)):
+        places = [pose for _, pose in layout.row]
+        if layout.row and layout.shuffle_row:
+            places = [places[int(i)] for i in rng.permutation(len(places))]
+        for index in rng.permutation(len(colors)):
             for _ in range(LAYOUT_DRAWS):
                 draws += 1
-                x, y = float(rng.uniform(*layout.bucket_x)), float(rng.uniform(*layout.bucket_y))
-                yaw = BUCKET_YAW
-                if layout.face_bases:
-                    base_x, base_y = layout.nearest_base(x, y)
-                    yaw += float(np.arctan2(y - base_y, x - base_x))
-                pose = Pose2D(x, y, yaw + float(rng.uniform(-BUCKET_YAW_RANGE, BUCKET_YAW_RANGE)))
+                pose = _draw_bucket(rng, layout, places[int(index)] if layout.row else None)
                 if not bucket_problems(
                     pose, buckets.values(), first=True, layout=DEFAULT_LAYOUT if default else layout
                 ):
-                    buckets[BUCKET_COLORS[int(index)]] = pose
+                    buckets[colors[int(index)]] = pose
                     break
             else:
                 break
-        if len(buckets) < len(BUCKET_COLORS):
+        if len(buckets) < len(colors):
             continue
         objects: dict[str, Pose2D] = {}
         for index in rng.permutation(len(OBJECTS)):
@@ -528,12 +579,13 @@ def sample_layout(
                 break
         if len(objects) == len(OBJECTS):
             return Layout(
-                buckets={color: buckets[color] for color in BUCKET_COLORS},
+                buckets={color: buckets[color] for color in colors},
                 objects={name: objects[name] for name in OBJECTS},
                 draws=draws,
             )
     logger.warning("Bucket sort: no layout found in {} draws; using the fallback layout", draws)
-    return Layout(buckets=FALLBACK_LAYOUT.buckets, objects=FALLBACK_LAYOUT.objects, draws=draws, fallback=True)
+    fallback_buckets = dict(layout.row) if layout.row else FALLBACK_LAYOUT.buckets
+    return Layout(buckets=fallback_buckets, objects=FALLBACK_LAYOUT.objects, draws=draws, fallback=True)
 
 
 # ----------------------------------------------------------------------
@@ -601,7 +653,7 @@ PHRASES = InstructionPhrases(
         ("I want the {object} in the {bucket}", 1.0, "plain"),
         ("the {object} goes in the {bucket}", 1.0, "plain"),
         ("the {object} belongs in the {bucket}", 1.0, "plain"),
-        ("of the three {containers}, put the {object} in the {color} one", 1.0, "plain"),
+        ("of the {count} {containers}, put the {object} in the {color} one", 1.0, "plain"),
     ),
     object_names={
         "battery": (
@@ -639,14 +691,17 @@ def canonical_text(obj: str, color: str) -> str:
     return f"put the {OBJECT_LABELS[obj]} in the {color} bucket"
 
 
-def word_instruction(rng: np.random.Generator, obj: str, color: str, phrases: InstructionPhrases = PHRASES) -> str:
+def word_instruction(
+    rng: np.random.Generator, obj: str, color: str, phrases: InstructionPhrases = PHRASES, *, count: int = 3
+) -> str:
     """Word the instruction "put *obj* in the *color* bucket" at random (:class:`InstructionPhrases`).
 
     Args:
         rng: The generator.
         obj: One of :data:`OBJECTS`.
-        color: One of :data:`BUCKET_COLORS`.
+        color: One of the scene's bucket colours.
         phrases: The words to use.
+        count: How many buckets the scene has.
 
     Returns:
         The sentence.
@@ -658,7 +713,11 @@ def word_instruction(rng: np.random.Generator, obj: str, color: str, phrases: In
     name = _choose(rng, phrases.object_names[obj])
     container = _choose(rng, phrases.containers)
     text = template.format(
-        object=name, bucket=f"{color} {container}", containers=phrases.plurals[container], color=color
+        object=name,
+        bucket=f"{color} {container}",
+        containers=phrases.plurals[container],
+        color=color,
+        count=NUMBER_WORDS.get(count, str(count)),
     )
     if kind != "plain" and rng.random() < phrases.please:
         if kind == "question":
@@ -708,11 +767,12 @@ class Instruction:
         return {"object": self.object, "bucket": self.bucket, "text": self.text, "canonical_text": self.canonical_text}
 
 
-def check_pairs(pairs: Iterable[Pair] | None) -> tuple[Pair, ...]:
+def check_pairs(pairs: Iterable[Pair] | None, colors: tuple[str, ...] = BUCKET_COLORS) -> tuple[Pair, ...]:
     """Validate a set of allowed (object, bucket colour) pairs.
 
     Args:
-        pairs: The allowed pairs; ``None`` allows all of :data:`ALL_PAIRS`.
+        pairs: The allowed pairs; ``None`` allows every pair of :data:`OBJECTS` and *colors*.
+        colors: The scene's bucket colours (:func:`bucket_colors`).
 
     Returns:
         The pairs without repeats, in :data:`ALL_PAIRS` order.
@@ -720,21 +780,26 @@ def check_pairs(pairs: Iterable[Pair] | None) -> tuple[Pair, ...]:
     Raises:
         ValueError: If a pair names an unknown object or colour, or no pair is left.
     """
+    every = ALL_PAIRS if colors == BUCKET_COLORS else tuple((obj, color) for obj in OBJECTS for color in colors)
     if pairs is None:
-        return ALL_PAIRS
+        return every
     wanted = {(str(obj), str(color)) for obj, color in pairs}
-    unknown = sorted(wanted - set(ALL_PAIRS))
+    unknown = sorted(wanted - set(every))
     if unknown:
-        msg = f"Unknown (object, bucket) pairs {unknown}; objects are {OBJECTS}, buckets {BUCKET_COLORS}"
+        msg = f"Unknown (object, bucket) pairs {unknown}; objects are {OBJECTS}, buckets {colors}"
         raise ValueError(msg)
     if not wanted:
         msg = "At least one (object, bucket) pair must be allowed"
         raise ValueError(msg)
-    return tuple(pair for pair in ALL_PAIRS if pair in wanted)
+    return tuple(pair for pair in every if pair in wanted)
 
 
 def sample_instruction(
-    rng: np.random.Generator, allowed_pairs: Iterable[Pair] | None = None, *, vary_text: bool | None = None
+    rng: np.random.Generator,
+    allowed_pairs: Iterable[Pair] | None = None,
+    *,
+    vary_text: bool | None = None,
+    colors: tuple[str, ...] = BUCKET_COLORS,
 ) -> Instruction:
     """Draw an instruction uniformly from the allowed (object, bucket colour) pairs, then word it.
 
@@ -743,14 +808,16 @@ def sample_instruction(
         allowed_pairs: The pairs to draw from (:func:`check_pairs`); ``None`` draws from all nine.
         vary_text: Word it at random (:func:`word_instruction`) or use the canonical sentence;
             ``None`` follows :data:`VARY_INSTRUCTION_TEXT`.
+        colors: The scene's bucket colours (:func:`bucket_colors`).
 
     Returns:
         The instruction.
     """
-    pairs = check_pairs(allowed_pairs)
+    pairs = check_pairs(allowed_pairs, colors)
     obj, color = pairs[int(rng.integers(len(pairs)))]
     vary = VARY_INSTRUCTION_TEXT if vary_text is None else vary_text
-    return Instruction(object=obj, bucket=color, wording=word_instruction(rng, obj, color) if vary else None)
+    wording = word_instruction(rng, obj, color, count=len(colors)) if vary else None
+    return Instruction(object=obj, bucket=color, wording=wording)
 
 
 def _yaw_quat(yaw: float) -> np.ndarray:
@@ -809,7 +876,10 @@ class BucketSortTask:
                 ``None`` follows :data:`VARY_INSTRUCTION_TEXT` at each reset.
             layout: Where the robot's buckets and objects may stand.
         """
-        self._allowed = check_pairs(allowed_pairs)
+        self._requested = None if allowed_pairs is None else tuple(allowed_pairs)
+        self.colors: tuple[str, ...] = BUCKET_COLORS
+        """The scene's bucket colours (:func:`bucket_colors`), read at each reset."""
+        self._allowed = check_pairs(self._requested, self.colors)
         self._place_home = place_home
         self._robot_roots = tuple(robot_roots)
         self._vary_text = vary_text
@@ -820,7 +890,7 @@ class BucketSortTask:
         """The current instruction; ``None`` before the first reset."""
         self.layout: Layout | None = None
         """Where the last reset put the buckets and objects; ``None`` before the first reset."""
-        self.slot_colors: tuple[str, ...] = BUCKET_COLORS
+        self.slot_colors: tuple[str, ...] = self.colors
         """The bucket colours left to right (by decreasing y) as the last reset put them."""
         self.reset_count = 0
         """How many resets have run: a new value means a new layout and instruction."""
@@ -835,7 +905,8 @@ class BucketSortTask:
 
         The current instruction stays until the next reset.
         """
-        self._allowed = check_pairs(pairs)
+        self._requested = None if pairs is None else tuple(pairs)
+        self._allowed = check_pairs(self._requested, self.colors)
 
     @property
     def vary_text(self) -> bool:
@@ -867,7 +938,13 @@ class BucketSortTask:
         if self._place_home is not None:
             self._place_home(model, data)
         footprints = self.footprints(model)
-        layout = sample_layout(rng, footprints, self.area)
+        colors = bucket_colors(model)
+        if colors != self.colors:
+            self.colors = colors
+            self._allowed = check_pairs(self._requested, colors)
+        layout = sample_layout(rng, footprints, self.area, colors)
+        if self.area.fill is not None:
+            set_bucket_fill(model, {color: float(rng.uniform(*self.area.fill)) for color in colors})
         for color, pose in layout.buckets.items():
             _set_free_pose(model, data, f"bucket_{color}:joint", (pose.x, pose.y, 0.0), pose.yaw)
         for name, pose in layout.objects.items():
@@ -876,7 +953,7 @@ class BucketSortTask:
             )
         self.layout = layout
         self.slot_colors = layout.colors_left_to_right
-        self.instruction = sample_instruction(rng, self._allowed, vary_text=self.vary_text)
+        self.instruction = sample_instruction(rng, self._allowed, vary_text=self.vary_text, colors=self.colors)
         self.reset_count += 1
         mujoco.mj_forward(model, data)
         logger.info(
@@ -913,7 +990,7 @@ class BucketSortTask:
                 "position": [float(v) for v in data.xpos[body]],
                 "wxyz": [float(v) for v in data.xquat[body]],
             }
-            for color in BUCKET_COLORS
+            for color in self.colors
             for body in (_body(model, f"bucket_{color}"),)
         }
         return TaskState(in_bucket=in_bucket, resting=resting, success=success, buckets=buckets)
@@ -930,7 +1007,7 @@ class BucketSortTask:
             "instruction": self.instruction.as_dict() if self.instruction is not None else None,
             "slots": [
                 {"slot": slot, "color": color, **(layout.buckets[color].as_dict() if layout is not None else {})}
-                for slot, color in zip(SLOT_NAMES, self.slot_colors, strict=True)
+                for slot, color in zip(slot_names(len(self.slot_colors)), self.slot_colors, strict=True)
             ],
             "allowed_pairs": [list(pair) for pair in self._allowed],
             "vary_text": self.vary_text,
@@ -959,6 +1036,76 @@ def _set_free_pose(
     data.qvel[dof : dof + 6] = 0.0
 
 
+_HIDDEN_GROUP = 5
+"""The geom group hidden contents move to: no renderer draws it by default."""
+
+
+def set_bucket_fill(model: object, fractions: Mapping[str, float]) -> dict[str, int]:
+    """Show the lowest *fraction* of each bucket's contents and hide the rest (drawn nowhere, no contacts).
+
+    The first call remembers each content geom's group and contact bits; later calls restore them for
+    the items shown.
+
+    Args:
+        model: The scene's model.
+        fractions: The fraction (0 to 1) of each colour's items to show; colours left out are unchanged.
+
+    Returns:
+        How many items each named colour shows.
+    """
+    import mujoco  # noqa: PLC0415
+
+    cache = _CONTENTS.get(id(model))
+    if cache is None:
+        cache = {}
+        for geom in range(int(model.ngeom)):
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom) or ""
+            if not name.startswith("bucket_") or "_item" not in name:
+                continue
+            color, rest = name[len("bucket_") :].split("_item", 1)
+            item = int(rest.split("_", 1)[0])
+            original = (int(model.geom_group[geom]), int(model.geom_contype[geom]), int(model.geom_conaffinity[geom]))
+            cache.setdefault(color, {}).setdefault(item, []).append((geom, original))
+        _CONTENTS[id(model)] = cache
+    shown: dict[str, int] = {}
+    for color, fraction in fractions.items():
+        items = cache.get(color, {})
+        count = round(float(np.clip(fraction, 0.0, 1.0)) * len(items))
+        for item, geoms in items.items():
+            for geom, (group, contype, conaffinity) in geoms:
+                visible = item < count
+                model.geom_group[geom] = group if visible else _HIDDEN_GROUP
+                model.geom_contype[geom] = contype if visible else 0
+                model.geom_conaffinity[geom] = conaffinity if visible else 0
+        shown[color] = count
+    return shown
+
+
+_CONTENTS: dict[int, dict[str, dict[int, list[tuple[int, tuple[int, int, int]]]]]] = {}
+"""Per model, each colour's content geoms by item, with their original group and contact bits."""
+
+
+def bucket_colors(model: object) -> tuple[str, ...]:
+    """Return the colours of the buckets *model* has (bodies ``bucket_<colour>``), in :data:`KNOWN_BUCKET_COLORS` order.
+
+    Returns:
+        The colours.
+    """
+    import mujoco  # noqa: PLC0415
+
+    body = mujoco.mjtObj.mjOBJ_BODY
+    return tuple(color for color in KNOWN_BUCKET_COLORS if mujoco.mj_name2id(model, body, f"bucket_{color}") >= 0)
+
+
+def slot_names(count: int) -> tuple[str, ...]:
+    """Name *count* buckets left to right as seen from behind the robot: :data:`SLOT_NAMES` for three.
+
+    Returns:
+        The names.
+    """
+    return SLOT_NAMES if count == len(SLOT_NAMES) else tuple(f"slot {i + 1}" for i in range(count))
+
+
 def bucket_containing(model: object, data: object, point: np.ndarray) -> str | None:
     """Return the colour of the bucket whose interior (:data:`BUCKET_INTERIOR`) holds *point*.
 
@@ -968,7 +1115,7 @@ def bucket_containing(model: object, data: object, point: np.ndarray) -> str | N
     Returns:
         The colour, or ``None`` outside every bucket.
     """
-    for color in BUCKET_COLORS:
+    for color in bucket_colors(model):
         body = _body(model, f"bucket_{color}")
         local = data.xmat[body].reshape(3, 3).T @ (np.asarray(point) - data.xpos[body])
         if all(lo <= value <= hi for value, (lo, hi) in zip(local, BUCKET_INTERIOR, strict=True)):
@@ -1173,6 +1320,7 @@ __all__ = [
     "BUCKET_YAW",
     "BUCKET_YAW_RANGE",
     "DEFAULT_LAYOUT",
+    "KNOWN_BUCKET_COLORS",
     "OBJECTS",
     "OBJECT_LABELS",
     "OBJECT_X",
@@ -1189,6 +1337,7 @@ __all__ = [
     "Pose2D",
     "TaskLayout",
     "TaskState",
+    "bucket_colors",
     "bucket_containing",
     "bucket_footprint",
     "bucket_problems",
@@ -1199,5 +1348,6 @@ __all__ = [
     "object_problems",
     "sample_instruction",
     "sample_layout",
+    "set_bucket_fill",
     "word_instruction",
 ]

@@ -267,6 +267,57 @@ def add_cameras(spec: mujoco.MjSpec, cameras: tuple[CameraSpec, ...], profile_na
             msg = f"{where} clashes with a model camera of that name"
             raise ValueError(msg)
         body.add_camera(name=camera.name, pos=list(camera.pos), quat=list(camera.quat), fovy=camera.fovy)
+        if camera.housing is not None:
+            import mujoco  # noqa: PLC0415
+
+            # behind the front face: the camera looks along its -z, so the box extends along +z
+            rotation = np.zeros(9)
+            mujoco.mju_quat2Mat(rotation, np.asarray(camera.quat, dtype=np.float64))
+            back = rotation.reshape(3, 3) @ np.array([0.0, 0.0, camera.housing[2]])
+            body.add_geom(
+                name=f"{camera.name}_housing",
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=list(camera.housing),
+                pos=list(np.asarray(camera.pos) + back),
+                quat=list(camera.quat),
+                contype=0,
+                conaffinity=0,
+                group=2,
+                density=0.0,
+                rgba=[0.12, 0.12, 0.13, 1.0],
+            )
+        if camera.mount_hull is not None:
+            import mujoco  # noqa: PLC0415
+
+            vertices, rgba = camera.mount_hull
+            mesh = spec.add_mesh()
+            mesh.name = f"{camera.name}_mount_hull"
+            mesh.uservert = [float(v) for vertex in vertices for v in vertex]  # no faces: MuJoCo draws the hull
+            body.add_geom(
+                name=f"{camera.name}_mount",
+                type=mujoco.mjtGeom.mjGEOM_MESH,
+                meshname=mesh.name,
+                contype=0,
+                conaffinity=0,
+                group=2,
+                density=0.0,
+                rgba=list(rgba),
+            )
+        elif camera.mount is not None:
+            import mujoco  # noqa: PLC0415
+
+            centre, half, rgba = camera.mount
+            body.add_geom(
+                name=f"{camera.name}_mount",
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=list(half),
+                pos=list(centre),
+                contype=0,
+                conaffinity=0,
+                group=2,
+                density=0.0,
+                rgba=list(rgba),
+            )
 
 
 def check_camera_names(spec: mujoco.MjSpec, where: object) -> None:

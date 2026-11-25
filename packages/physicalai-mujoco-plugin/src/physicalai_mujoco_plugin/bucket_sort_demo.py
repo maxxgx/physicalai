@@ -63,11 +63,11 @@ import numpy as np
 from loguru import logger
 
 from physicalai_mujoco_plugin.bucket_sort import (
-    BUCKET_COLORS,
     BUCKET_INTERIOR,
     DEFAULT_LAYOUT,
     OBJECT_Y,
     OBJECTS,
+    bucket_colors,
     bucket_containing,
 )
 from physicalai_mujoco_plugin.bucket_sort_arms import (
@@ -1020,7 +1020,7 @@ class _Clearance:
             if others
             else None
         )
-        self.buckets = collision_geoms(tuple(f"bucket_{color}" for color in BUCKET_COLORS))
+        self.buckets = collision_geoms(tuple(f"bucket_{color}" for color in bucket_colors(model)))
         self.objects = {name: collision_geoms((name,)) for name in OBJECTS}
         self.table = np.array([int(model.geom("table_top").id)])
         self._fromto = np.zeros(6)
@@ -1201,7 +1201,7 @@ class Planner:
         self.shapes = {name: object_shape(model, name) for name in OBJECTS}
         self._object_qpos = {name: int(model.jnt_qposadr[model.joint(f"{name}:joint").id]) for name in OBJECTS}
         self._object_body = {name: int(model.body(name).id) for name in OBJECTS}
-        self._bucket_body = {color: int(model.body(f"bucket_{color}").id) for color in BUCKET_COLORS}
+        self._bucket_body = {color: int(model.body(f"bucket_{color}").id) for color in bucket_colors(model)}
         self.held_width = 0.04
         """The width the last attempt script grasps; the place re-plan and the clearance use it."""
         self.unreached = False
@@ -1998,7 +1998,7 @@ class BucketSortDemonstrator:
         """Since when every arm stands still on its targets (several arms)."""
         """The targets each arm that does not work holds, model units (seven joints and the opening in metres)."""
         self._object_body = {name: int(model.body(name).id) for name in OBJECTS}
-        self._bucket_body = {color: int(model.body(f"bucket_{color}").id) for color in BUCKET_COLORS}
+        self._bucket_body = {color: int(model.body(f"bucket_{color}").id) for color in bucket_colors(model)}
         self._q: np.ndarray | None = None
         self._q_prev: np.ndarray | None = None
         self._braking_from = self.ik.home.copy()

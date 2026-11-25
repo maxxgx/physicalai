@@ -146,7 +146,7 @@ class TestProfiles:
 
     def test_scenes_list_the_twins(self) -> None:
         assert set(list_scenes_naming("trossen_wxai")) == {"single_pick_place", "bucket_sort"}
-        assert set(list_scenes_naming("rebot_b601")) == {"single_pick_place", "bucket_sort"}
+        assert set(list_scenes_naming("rebot_b601")) == {"single_pick_place", "bucket_sort", "bucket_sort_desk"}
         for name in ("so101", "trossen_wxai", "rebot_b601"):
             assert supported_arm_counts(get_profile(name)) == (1, 2)
 
@@ -300,11 +300,11 @@ def test_rebot_wrist_camera_sits_on_the_d405_mount() -> None:
         link6 = model.body("link6").id
         assert int(model.cam_bodyid[wrist]) == link6  # rolls with the gripper
         assert model.cam_fovy[wrist] == pytest.approx(58.0)  # the D405's vertical field of view
-        # In link6 (+z = roll axis toward the fingers): the front face 104 mm off the axis on the
-        # assumed +x side, 39 mm along it; looking 30 degrees toward the axis, image up away from it.
+        # In link6 (+z = roll axis toward the fingers): the lens 102 mm off the axis on the +x side, 60 mm
+        # along it (triangulated on the real arm); looking 30 degrees toward the axis, image up away from it.
         frame = data.xmat[link6].reshape(3, 3)
         camera = frame.T @ data.cam_xmat[wrist].reshape(3, 3)
-        np.testing.assert_allclose(frame.T @ (data.cam_xpos[wrist] - data.xpos[link6]), [0.10414, 0, 0.03915], atol=1e-9)
+        np.testing.assert_allclose(frame.T @ (data.cam_xpos[wrist] - data.xpos[link6]), [0.1017, 0.0031, 0.0602], atol=1e-9)
         np.testing.assert_allclose(-camera[:, 2], [-0.5, 0, np.sqrt(3) / 2], atol=1e-9)  # forward
         np.testing.assert_allclose(camera[:, 1], [np.sqrt(3) / 2, 0, 0.5], atol=1e-9)  # image up
         np.testing.assert_allclose(camera[:, 0], [0, 1, 0], atol=1e-9)  # image right

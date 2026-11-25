@@ -614,7 +614,7 @@ class TestSimulationLaunch:
             "MuJoCo_SO101_Follower": so101,
             "MuJoCo_SO101_Bimanual_Follower": so101,
             "MuJoCo_WidowXAI_Follower": ["single_pick_place"],
-            "MuJoCo_WidowXAI_Bimanual_Follower": ["single_pick_place"],
+            "MuJoCo_WidowXAI_Bimanual_Follower": ["single_pick_place", "booth_task"],
             "MuJoCo_FrankaResearch3_Follower": ["single_pick_place", "bucket_sort"],
             **dict.fromkeys(
                 ["MuJoCo_UnitreeG1_Follower", "MuJoCo_UnitreeGo2_Follower", "MuJoCo_BostonDynamicsSpot_Follower"],

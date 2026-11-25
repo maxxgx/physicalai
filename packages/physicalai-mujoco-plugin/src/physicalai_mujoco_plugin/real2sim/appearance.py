@@ -19,6 +19,7 @@ leaves its captured image behind (a per-object splat removes that).
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import json
@@ -33,7 +34,14 @@ from loguru import logger
 
 from physicalai_mujoco_plugin.real2sim.geometry import Similarity
 from physicalai_mujoco_plugin.real2sim.robot_mask import environment_geoms, object_geoms
-from physicalai_mujoco_plugin.real2sim.splats import Splats, matrix_to_quat, read_ply_fields, viewer_subset
+from physicalai_mujoco_plugin.real2sim.splats import (
+    Splats,
+    matrix_to_quat,
+    read_ply,
+    read_ply_fields,
+    transform_splats,
+    viewer_subset,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -377,6 +385,12 @@ def load_compositors(meta_path: Path, images_dir: Path, model: mujoco.MjModel) -
         Compositors by camera name.
     """
     meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+    if "photoreal" in meta:  # Metal splat + MuJoCo compositing with shadows and occlusion (Mac)
+        from physicalai_mujoco_plugin.real2sim.photoreal import load_photoreal_compositors  # noqa: PLC0415
+
+        compositors = load_photoreal_compositors(meta, model)
+        logger.info("Photoreal appearance for cameras {}", sorted(compositors))
+        return compositors  # type: ignore[return-value]
     environment = environment_geoms(model, meta)
     objects: dict[int, np.ndarray] = {}
     for obj in meta["objects"]:
@@ -426,7 +440,7 @@ def compositor_factory(meta_path: str | Path) -> Callable[[mujoco.MjModel], dict
         A function building the compositors for a compiled model.
     """
     meta_path = Path(meta_path)
-    images_dir = Path(json.loads(meta_path.read_text(encoding="utf-8"))["images_dir"])
+    images_dir = Path(json.loads(meta_path.read_text(encoding="utf-8")).get("images_dir", "."))
     return functools.partial(load_compositors, meta_path, images_dir)
 
 
@@ -440,7 +454,7 @@ def capture_streams(meta_path: str | Path, streams: list[CameraConfig]) -> list[
         The streams, capture cameras resized.
     """
     meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
-    sizes = {cam["name"]: (int(cam["width"]), int(cam["height"])) for cam in meta["cameras"]}
+    sizes = {cam["name"]: (int(cam["width"]), int(cam["height"])) for cam in meta.get("cameras", [])}
     return [
         dataclasses.replace(
             stream, width=STREAM_WIDTH, height=round(STREAM_WIDTH * sizes[stream.name][1] / sizes[stream.name][0])
@@ -451,20 +465,57 @@ def capture_streams(meta_path: str | Path, streams: list[CameraConfig]) -> list[
     ]
 
 
-def show_splats(server: object, meta_path: str | Path, *, max_splats: int = 1_000_000) -> None:
+def show_splats(
+    server: object, meta_path: str | Path, *, max_splats: int = 1_000_000, model: mujoco.MjModel | None = None
+) -> object | None:
     """Draw the scene's Gaussians (``splats.npz``) in a viser server, around the simulated robot.
 
     Only the visible Gaussians near the table are drawn (:func:`viewer_subset`), at most
     ``max_splats``, to keep the browser responsive. The sim geometry they duplicate is hidden by
-    the viewer (:func:`viewer_hidden_groups`).
+    the viewer (:func:`viewer_hidden_groups`). A photoreal kit with ``model`` given is shown as each
+    browser's background image instead (:class:`~physicalai_mujoco_plugin.real2sim.viewer_background.SplatViewerBackground`),
+    composited the way the offline renders are.
+
+    Returns:
+        The background service for a photoreal kit (keep it alive), else ``None``.
     """
     meta_path = Path(meta_path)
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    name = meta.get("splats")
-    if not name:
-        return
-    splats = Splats.load(meta_path.parent / name)
-    keep = viewer_subset(splats, np.asarray(meta["table_min"]), np.asarray(meta["table_max"]), max_count=max_splats)
+    if "photoreal" in meta:  # a photoreal kit: the trained splat's PLY in the capture frame, and its transform
+        photoreal = meta["photoreal"]
+        name = str(photoreal["splat_ply"])
+        splats = transform_splats(read_ply(Path(name)), Similarity.from_dict(photoreal["transform"]))
+        # the booth: the table with room for the backdrop, the TV and the lamps above it
+        keep = viewer_subset(splats, np.array([-0.5, -0.55]), np.array([0.65, 0.6]), margin=0.4, above=1.2,
+                             max_count=max_splats)
+        # the splat only looks right from near the capture's viewpoints: put each new browser where the phone stood
+        # (audience side). Registered after mjviser's own connect handler, which aims at the model's centre.
+        with contextlib.suppress(Exception):
+
+            @server.on_client_connect  # type: ignore[attr-defined]
+            def _phone_view(client: Any) -> None:
+                client.camera.position = (1.35, -0.15, 0.6)
+                client.camera.look_at = (0.1, 0.0, 0.12)
+                client.camera.up_direction = (0.0, 0.0, 1.0)
+
+        if model is not None and photoreal.get("viewer_background", True):
+            try:
+                from physicalai_mujoco_plugin.real2sim.viewer_background import SplatViewerBackground  # noqa: PLC0415
+
+                background = SplatViewerBackground(
+                    server, model, Path(name), Similarity.from_dict(photoreal["transform"]), viewer_hidden_bodies(meta_path)
+                )
+            except Exception as exc:  # noqa: BLE001 - fall back to the browser's own splats
+                logger.warning("Splat background unavailable ({}); drawing the Gaussians in the browser", exc)
+            else:
+                logger.info("Viewer shows {} as a per-client background (Metal), composited like the offline renders", name)
+                return background
+    else:
+        name = meta.get("splats")
+        if not name:
+            return None
+        splats = Splats.load(meta_path.parent / name)
+        keep = viewer_subset(splats, np.asarray(meta["table_min"]), np.asarray(meta["table_max"]), max_count=max_splats)
     shown = splats.take(keep)
     try:
         server.scene.add_gaussian_splats(  # type: ignore[attr-defined]
@@ -476,8 +527,35 @@ def show_splats(server: object, meta_path: str | Path, *, max_splats: int = 1_00
         )
     except Exception as exc:  # noqa: BLE001 - the viewer is optional; the sim runs without the splats
         logger.warning("Could not show the captured splats in the viewer: {}", exc)
-        return
+        return None
     logger.info("Viewer shows {} of {} captured Gaussians from {}", len(keep), len(splats), name)
+    return None
+
+
+VIEWER_HIDE_BODIES = ("table", "bin", "bracket", "pole_0", "pole_1", "camera_bar", "tv_screen")
+"""Static fixtures a photoreal kit's splat already shows in the viewer (drawing the sim's solids too doubles them)."""
+
+
+def viewer_hidden_bodies(meta_path: str | Path) -> frozenset[str]:
+    """Bodies the browser viewer leaves out because the splat it shows already holds them (photoreal kits).
+
+    Returns:
+        Body names; empty for other appearance files.
+    """
+    meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+    if "photoreal" not in meta:
+        return frozenset()
+    return frozenset(meta["photoreal"].get("viewer_hide_bodies", VIEWER_HIDE_BODIES))
+
+
+def apply_appearance_look(model: mujoco.MjModel, meta_path: str | Path) -> None:
+    """Give ``model`` the photoreal kit's ``sim_look`` (before the viewer uploads its meshes and textures)."""
+    meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+    look = meta.get("photoreal", {}).get("sim_look")
+    if look:
+        from physicalai_mujoco_plugin.real2sim.photoreal import apply_sim_look  # noqa: PLC0415
+
+        apply_sim_look(model, look)
 
 
 def viewer_hidden_groups(model: mujoco.MjModel, meta_path: str | Path) -> frozenset[int]:

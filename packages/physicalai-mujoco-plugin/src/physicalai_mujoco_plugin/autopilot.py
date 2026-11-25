@@ -1,7 +1,10 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run the scripted conveyor demonstrator inside the simulation loop.
+"""Run a scene's scripted demonstrator inside the simulation loop.
+
+Two scenes have one: ``conveyor_sort`` (one SO-101 sorting items off the belt) and ``booth_task``
+(two WidowX AI arms, :mod:`physicalai_mujoco_plugin.booth_task`).
 
 Two ways to use it:
 
@@ -20,6 +23,7 @@ from typing import TYPE_CHECKING, Literal, get_args
 if TYPE_CHECKING:
     import numpy as np
 
+    from physicalai_mujoco_plugin.booth_task.plugin import BoothAutopilot
     from physicalai_mujoco_plugin.conveyor import ConveyorSort
     from physicalai_mujoco_plugin.conveyor_demo import ConveyorDemonstrator
 
@@ -33,13 +37,13 @@ class Autopilot:
     def __init__(self) -> None:
         """Start switched off, with no scene bound."""
         self._mode: AutopilotMode = "off"
-        self._demo: ConveyorDemonstrator | None = None
+        self._demo: ConveyorDemonstrator | BoothAutopilot | None = None
         self._unavailable: str | None = None
         """Why a conveyor scene has no autopilot, for the viewer and ``POST /autopilot``."""
 
     @property
     def available(self) -> bool:
-        """Whether the current scene has a demonstrator (conveyor scenes only)."""
+        """Whether the current scene has a demonstrator (the conveyor and booth scenes)."""
         return self._demo is not None
 
     @property
@@ -55,11 +59,21 @@ class Autopilot:
     def bind(self, model: object | None, conveyor: ConveyorSort | None, *, robots: int = 1) -> None:
         """Attach to a freshly loaded scene, switched off.
 
-        Scenes without a conveyor have no autopilot, and neither has a conveyor with several arms:
-        the demonstrator drives one SO-101.
+        The conveyor scene's demonstrator drives one SO-101; the booth scene's drives both WidowX AI
+        arms. Other scenes have no autopilot.
         """
         self._mode = "off"  # a mode chosen for an earlier scene must not come back with this one
         self._unavailable = None
+        if model is not None and conveyor is None:
+            from physicalai_mujoco_plugin.booth_task.plugin import BoothAutopilot, is_booth_model  # noqa: PLC0415
+
+            if is_booth_model(model):
+                if robots == 2:  # noqa: PLR2004 - the booth task needs both arms
+                    self._demo = BoothAutopilot(model)  # type: ignore[arg-type]
+                else:
+                    self._demo = None
+                    self._unavailable = f"The booth autopilot drives two WidowX AI arms; this simulation has {robots}."
+                return
         if model is None or conveyor is None:
             self._demo = None
             return
@@ -92,8 +106,8 @@ class Autopilot:
         """Advance the demonstrator by one tick.
 
         Returns:
-            The demonstrator's joint targets in radians (``SO101_JOINT_ORDER``),
-            or ``None`` when the autopilot is off.
+            The demonstrator's targets in model units, in the robot's channel order (radians for
+            joints, metres for the WidowX AI grippers), or ``None`` when the autopilot is off.
         """
         if self._demo is None or self._mode == "off":
             return None

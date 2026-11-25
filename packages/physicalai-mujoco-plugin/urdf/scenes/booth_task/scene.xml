@@ -1,0 +1,110 @@
+<mujoco model="booth_task">
+  <compiler angle="radian"/>
+
+  <option timestep="0.00166667" impratio="10" integrator="implicitfast" cone="elliptic"/>
+
+  <visual>
+    <global offwidth="1920" offheight="1080"/>
+    <quality shadowsize="8192" offsamples="8"/>
+  </visual>
+
+  <asset>
+    <texture type="2d" colorspace="linear" name="table_albedo" file="table_albedo.png"/>
+    <texture type="2d" colorspace="linear" name="tv_screen" file="tv_screen.png"/>
+    <texture type="2d" colorspace="linear" name="box_decal" file="box_decal.png"/>
+    <material name="table" specular="0.1" shininess="0.1" rgba="0.93 0.91 0.87 1"/>
+    <material name="bin_grey" specular="0.15" shininess="0.2" rgba="0.17 0.17 0.18 1"/>
+    <material name="bracket_red" specular="0.2" shininess="0.3" rgba="0.8 0.05 0.06 1"/>
+    <material name="cover_blue" specular="0.2" shininess="0.3" rgba="0.07 0.45 0.92 1"/>
+    <material name="box_black" specular="0.35" shininess="0.4" rgba="0.06 0.06 0.07 1"/>
+    <material name="pole" specular="0.3" shininess="0.4" rgba="0.12 0.12 0.13 1"/>
+    <material name="table_textured" texture="table_albedo" specular="0.05" shininess="0.1"/>
+    <material name="tv_screen" texture="tv_screen" emission="1"/>
+    <material name="box_decal" texture="box_decal" specular="0.35" shininess="0.4"/>
+    <material name="base_plate" specular="0.4" shininess="0.4" rgba="0.025 0.025 0.028 1"/>
+    <mesh name="table_top_visual" content_type="model/obj" file="table_top.obj" inertia="shell"/>
+    <mesh name="tv_screen" content_type="model/obj" file="tv_screen.obj" inertia="shell"/>
+    <mesh name="box_decal" content_type="model/obj" file="box_decal.obj" inertia="shell"/>
+  </asset>
+
+  <worldbody>
+    <camera name="overview" quat="-0.694411 -0.0232319 0.0290939 0.718615" pos="0.2186 0.0129 0.5281" fovy="65.02"/>
+    <light name="ring_lamp_0" pos="0.41794 0.352959 0.511384" dir="-0.228844 -0.231661 -0.945496" bulbradius="0.101069" cutoff="75" exponent="1" diffuse="0.42 0.42 0.42" specular="0.25 0.25 0.25"/>
+    <light name="ring_lamp_1" pos="0.428126 -0.229505 0.491086" dir="-0.401757 0.733245 -0.548582" bulbradius="0.0918419" cutoff="75" exponent="1" diffuse="0.42 0.42 0.42" specular="0.25 0.25 0.25"/>
+    <light name="hall_fill" castshadow="false" pos="0.1 0 2.5" ambient="0.12 0.12 0.12" diffuse="0.22 0.22 0.22" specular="0.05 0.05 0.05" type="directional"/>
+    <body name="table">
+      <geom name="table_top" size="0.559911 0.536407 0.0125" pos="0.0809388 0.0301751 -0.0125" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="table"/>
+      <geom name="table_visual" pos="0 0 0.0003" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" mass="0" material="table_textured" mesh="table_top_visual"/>
+    </body>
+    <body name="tv_screen">
+      <geom name="tv_screen_visual" pos="0 0 0" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" mass="0" material="tv_screen" mesh="tv_screen"/>
+    </body>
+    <body name="bin" pos="0.384239 0.202436 0" quat="0.999695 0 0 0.0247098">
+      <geom name="bin_base" size="0.0912876 0.0894816 0.0269668" pos="0 0 0.0269668" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bin_grey"/>
+      <geom name="bin_wall_y-" size="0.0986972 0.00370482 0.0452331" pos="0 -0.0931864 0.0452331" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bin_grey"/>
+      <geom name="bin_wall_y+" size="0.0986972 0.00370482 0.0452331" pos="0 0.0931864 0.0452331" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bin_grey"/>
+      <geom name="bin_wall_x-" size="0.00370482 0.0894816 0.0452331" pos="-0.0949924 0 0.0452331" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bin_grey"/>
+      <geom name="bin_wall_x+" size="0.00370482 0.0894816 0.0452331" pos="0.0949924 0 0.0452331" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bin_grey"/>
+      <geom name="bin_divider_0" size="0.0912876 0.0025 0.0452331" pos="0 -0.0465932 0.0452331" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bin_grey"/>
+      <geom name="bin_divider_1" size="0.0912876 0.0025 0.0452331" pos="0 0 0.0452331" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bin_grey"/>
+      <geom name="bin_divider_2" size="0.0912876 0.0025 0.0452331" pos="0 0.0465932 0.0452331" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bin_grey"/>
+    </body>
+    <body name="bracket" pos="0.125873 0.0407708 0" quat="0.998848 0 0 0.0479914">
+      <geom name="bracket_floor" size="0.0578734 0.0991743 0.003" pos="0 0 0.003" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bracket_red"/>
+      <geom name="bracket_rim_x-" size="0.004 0.0991743 0.00818389" pos="-0.0538734 0 0.00818389" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bracket_red"/>
+      <geom name="bracket_rim_x+" size="0.004 0.0991743 0.00818389" pos="0.0538734 0 0.00818389" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bracket_red"/>
+      <geom name="bracket_rim_y-" size="0.0578734 0.009 0.00818389" pos="0 -0.0901743 0.00818389" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bracket_red"/>
+      <geom name="bracket_ear_--" size="0.0132582 0.009 0.0177814" pos="-0.0446152 -0.0901743 0.0177814" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bracket_red"/>
+      <geom name="bracket_ear_+-" size="0.0132582 0.009 0.0177814" pos="0.0446152 -0.0901743 0.0177814" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bracket_red"/>
+      <geom name="bracket_rim_y+" size="0.0578734 0.009 0.00818389" pos="0 0.0901743 0.00818389" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bracket_red"/>
+      <geom name="bracket_ear_-+" size="0.0132582 0.009 0.0177814" pos="-0.0446152 0.0901743 0.0177814" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bracket_red"/>
+      <geom name="bracket_ear_++" size="0.0132582 0.009 0.0177814" pos="0.0446152 0.0901743 0.0177814" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="bracket_red"/>
+    </body>
+    <body name="pole_0">
+      <geom name="pole_0_geom" size="0.02 0.375" pos="0.2222 -0.4558 0.375" type="cylinder" material="pole"/>
+    </body>
+    <body name="pole_1">
+      <geom name="pole_1_geom" size="0.02 0.375" pos="0.176 0.4883 0.375" type="cylinder" material="pole"/>
+    </body>
+    <body name="camera_bar">
+      <geom name="camera_bar_geom" size="0.015 0.472615" pos="0.1991 0.01625 0.6" quat="0.707107 0.706262 0.0345613 0" type="capsule" material="pole"/>
+    </body>
+    <body name="box" pos="0.380665 0.271631 0.101634" quat="0.706891 0.706891 0.0174724 0.0174724">
+      <joint name="box:joint" type="free"/>
+      <geom name="box_base" size="0.0775 0.0475 0.006" pos="0 0 -0.0115" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0.27631" material="box_black"/>
+      <geom name="box_body" size="0.0625 0.036 0.0115" pos="0 0 0.006" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0.32369" material="box_black"/>
+      <geom name="box_fin_0" size="0.00075 0.03 0.002" pos="0.003 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_fin_1" size="0.00075 0.03 0.002" pos="0.0072 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_fin_2" size="0.00075 0.03 0.002" pos="0.0114 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_fin_3" size="0.00075 0.03 0.002" pos="0.0156 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_fin_4" size="0.00075 0.03 0.002" pos="0.0198 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_fin_5" size="0.00075 0.03 0.002" pos="0.024 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_fin_6" size="0.00075 0.03 0.002" pos="0.0282 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_fin_7" size="0.00075 0.03 0.002" pos="0.0324 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_fin_8" size="0.00075 0.03 0.002" pos="0.0366 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_fin_9" size="0.00075 0.03 0.002" pos="0.0408 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_fin_10" size="0.00075 0.03 0.002" pos="0.045 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_fin_11" size="0.00075 0.03 0.002" pos="0.0492 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_fin_12" size="0.00075 0.03 0.002" pos="0.0534 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_fin_13" size="0.00075 0.03 0.002" pos="0.0576 0 0.0195" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0" material="box_black"/>
+      <geom name="box_decal" pos="0 0 0.0178" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" mass="0" material="box_decal" mesh="box_decal"/>
+    </body>
+    <body name="cover" pos="0.520611 -0.0900509 0.0005" quat="0.99828 0 0 0.0586234">
+      <joint name="cover:joint" type="free"/>
+      <geom name="cover_plateau" size="0.0491644 0.0834312 0.002" pos="0 0 0.0213283" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0.0644744" material="cover_blue"/>
+      <geom name="cover_wall_-" size="0.0491644 0.002 0.0116641" pos="0 -0.0814312 0.0116641" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0.00901387" material="cover_blue"/>
+      <geom name="cover_foot_-" size="0.0491644 0.00938788 0.002" pos="0 -0.0928191 0.002" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0.00725482" material="cover_blue"/>
+      <geom name="cover_wall_+" size="0.0491644 0.002 0.0116641" pos="0 0.0814312 0.0116641" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0.00901387" material="cover_blue"/>
+      <geom name="cover_foot_+" size="0.0491644 0.00938788 0.002" pos="0 0.0928191 0.002" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0.00725482" material="cover_blue"/>
+      <geom name="cover_tab" size="0.015 0.0025 0.0101393" pos="0 0 0.0334676" type="box" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" mass="0.00298824" material="cover_blue"/>
+    </body>
+    <body name="base_plate_0">
+      <geom name="base_plate_0_geom" size="0.06 0.0375 0.003" pos="-0.01 0.208 0.003" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="base_plate"/>
+    </body>
+    <body name="base_plate_1">
+      <geom name="base_plate_1_geom" size="0.06 0.0375 0.003" pos="0.01 -0.208 0.003" type="box" contype="0" conaffinity="0" group="1" friction="0.9 0.01 0.0002" solref="0.004" solimp="0.95 0.99" material="base_plate"/>
+    </body>
+    <frame name="left_robot_mount" pos="-0.01 0.208 0"/>
+    <frame name="right_robot_mount" pos="0.01 -0.208 0"/>
+  </worldbody>
+</mujoco>

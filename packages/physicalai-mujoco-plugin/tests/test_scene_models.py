@@ -314,7 +314,9 @@ def test_scene_xml_camera_reload_keeps_the_compiled_poses(scene_id: str) -> None
         profile = "so101"
     else:
         profile = robots[0] if robots != "*" else "unitree_go2"
-    robot = MuJoCoRobot(profile, scene=scene_id, substeps=1, cameras=[])
+    # A scene written for two arms only (booth_task) runs bimanual.
+    bimanual = 1 not in get_scene(scene_id).arm_counts
+    robot = MuJoCoRobot(profile, scene=scene_id, substeps=1, cameras=[], bimanual=bimanual)
     robot.connect()
     try:
         model, data = robot._model, robot._data

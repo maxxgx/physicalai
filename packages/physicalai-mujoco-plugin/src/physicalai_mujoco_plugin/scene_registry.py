@@ -176,6 +176,10 @@ class SceneConfig:
     """The ``front`` overview style's camera placement; ``None``: the scene offers only its own (``shoulder``)."""
     profile_front_overrides: tuple[tuple[str, FrontOverride], ...] = ()
     """Per profile: changes to the derived ``front`` camera pose (:class:`FrontOverride`)."""
+    tune_model: Callable[[mujoco.MjModel], None] | None = None
+    """Called once on every freshly compiled model of this scene, before it is stepped: parameter
+    changes that cannot be written in the scene XML because they belong to the attached robot (the
+    booth task's gripper force and finger coupling)."""
 
     @property
     def scene_xml_path(self) -> Path:
@@ -367,7 +371,10 @@ class SceneConfig:
         Returns:
             The compiled model, laid out for the profile, with the *overview* camera style.
         """
-        return load_scene_model(self.scene_xml_path, profile, scene_layout=self.layout_for(profile, arms, overview))
+        model = load_scene_model(self.scene_xml_path, profile, scene_layout=self.layout_for(profile, arms, overview))
+        if self.tune_model is not None:
+            self.tune_model(model)
+        return model
 
 
 # Gripper hovering ~8 cm above the near belt rail, angled down at the pick zone.
@@ -571,6 +578,23 @@ def _conveyor_sort_reset(home: tuple[tuple[str, float], ...]) -> ResetFn:
     return reset
 
 
+_BOOTH_SLEEP = tuple((f"joint_{i}", float(np.radians(deg))) for i, deg in enumerate((0.0, 2.0, 5.0, 0.0, 0.0, 0.0)))
+"""Home for ``POST /home``: the driver's zero pose with shoulder and elbow lifted (``booth_task.scene.SLEEP_LIFT``),
+without importing MuJoCo here. The scene reset puts each arm at its own fitted SLEEP (``SLEEP_POSES``)."""
+
+
+def _booth_tune(model: mujoco.MjModel) -> None:
+    from physicalai_mujoco_plugin.booth_task.scene import tune_model  # noqa: PLC0415
+
+    tune_model(model)
+
+
+def _booth_reset(model: object, data: object, rng: np.random.Generator) -> None:
+    from physicalai_mujoco_plugin.booth_task.plugin import booth_reset  # noqa: PLC0415
+
+    booth_reset(model, data, rng)  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # Scene configurations
 # ---------------------------------------------------------------------------
@@ -679,6 +703,21 @@ _SCENES: dict[str, SceneConfig] = {
         # far enough to frame the arm at home (tests/test_compose.py).
         front_view=FrontView(distance=1.4, aim=(0.35, 0.0, 0.25), elevation_deg=55.0),
     ),
+    "booth_task": SceneConfig(
+        scene_id="booth_task",
+        display_name="Booth Task (WidowX AI pair)",
+        description=(
+            "The conference booth demo: LEFT takes the INTEL box from the bin, hands it to RIGHT in the air, "
+            "RIGHT lays it in the red bracket and covers it with the blue cover, then everything goes back"
+        ),
+        scene_xml_relpath="scenes/booth_task/scene.xml",
+        free_joints=("box:joint", "cover:joint"),
+        robots=("trossen_wxai",),
+        written_arms=2,
+        arm_counts=(2,),
+        home_qpos=_BOOTH_SLEEP,
+        tune_model=_booth_tune,
+    ),
     "floor_flat": SceneConfig(
         scene_id="floor_flat",
         display_name="Flat Floor",
@@ -694,6 +733,7 @@ _FREEJOINT_SPAWN_SCENES = ("single_pick_place",)
 """Scenes whose reset respawns their free objects in the spawn arc laid out for the robot."""
 
 _RESET_FUNCTIONS: dict[str, Callable[[SceneConfig, int, tuple[int, ...]], ResetFn]] = {
+    "booth_task": lambda _scene, _arms, _roots: _booth_reset,
     "yahtzee": lambda _scene, _arms, roots: _yahtzee_reset(roots),
     "conveyor_sort": lambda scene, arms, _roots: _conveyor_sort_reset(scene.home_pose(arms)),
     "bucket_sort": lambda scene, arms, roots: _bucket_sort_reset(scene.home_pose(arms), roots),

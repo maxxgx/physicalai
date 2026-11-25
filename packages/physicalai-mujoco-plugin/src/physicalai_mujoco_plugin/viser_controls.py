@@ -616,6 +616,8 @@ class SimControlPanel:
         self._build_seed_controls(state)
         if state.episode.get("enabled"):
             self._build_episode_controls(state)
+        if state.autopilot.get("available") and not _is_conveyor(state.episode):
+            self._build_autopilot_controls(state, studio=False)  # the booth's two-arm demonstrator
         if state.objects:
             self._build_object_controls()
         if state.cameras:
@@ -840,7 +842,8 @@ class SimControlPanel:
                 value = min(max(float(speed.value) / 100.0, 0.0), MAX_BELT_SPEED)
                 self._submit(SetBeltSpeedCommand(speed=value))
 
-    def _build_autopilot_controls(self, state: PanelState) -> None:
+    def _build_autopilot_controls(self, state: PanelState, *, studio: bool = True) -> None:
+        """The autopilot's mode and status; with ``studio``, the conveyor's Studio recording controls too."""
         gui = self._server.gui
         with gui.add_folder("Autopilot"):
             mode = gui.add_dropdown(
@@ -848,11 +851,20 @@ class SimControlPanel:
                 options=tuple(AUTOPILOT_LABELS.values()),
                 initial_value=AUTOPILOT_LABELS.get(state.autopilot.get("mode", "off"), "Off"),
                 hint=(
-                    "The scripted demonstrator sorts the belt. 'Drive the arm' moves it directly; "
-                    "'Virtual leader' only publishes targets for Studio's MuJoCo SO-101 Virtual Leader"
+                    "The scripted demonstrator runs the scene's task. 'Drive the arm' moves the arms directly; "
+                    "'Virtual leader' only publishes targets for Studio's virtual leader"
                 ),
             )
             status = gui.add_markdown(_autopilot_markdown(state.autopilot))
+            if not studio:
+                self._handles.autopilot_mode = (mode, status)
+
+                @mode.on_update
+                def _on_booth_mode(event: object) -> None:
+                    if not _is_server_event(event):
+                        self._submit(SetAutopilotCommand(mode=_AUTOPILOT_BY_LABEL[str(mode.value)]))
+
+                return
             studio = state.studio
             active = studio.get("phase", "off") not in {"off", "done", "stopped", "error"}
             toggle = gui.add_checkbox(

@@ -65,6 +65,8 @@ class ViewerService:
         self.server: object | None = None
         self.scene: object | None = None
         self.hidden_geom_groups: frozenset[int] = frozenset()
+        self.hidden_bodies: frozenset[str] = frozenset()
+        """Bodies left out of the viewer (a photoreal kit's splat already shows them); the cameras still draw them."""
         """Geom groups the 3D viewer starts with hidden (real2sim: sim geometry a captured splat shows)."""
         self.panel: SimControlPanel | None = None
         self.native: object | None = None
@@ -228,7 +230,7 @@ class ViewerService:
         server.gui.reset()
         server.scene.reset()
 
-        scene = ViserMujocoScene(server, self._model, num_envs=1)
+        scene = ViserMujocoScene(server, _without_bodies(self._model, self.hidden_bodies), num_envs=1)
         scene.camera_tracking_enabled = False
         # mjviser's default refresh re-renders from the viser thread while the sim thread may be
         # stepping the same data; the sim loop re-renders at the control rate anyway.
@@ -372,6 +374,19 @@ def _cast_fixed_shadows(scene: object) -> None:
     """
     for handle in (getattr(scene, "_fixed_geom_handles", None) or {}).values():
         handle.cast_shadow = True
+
+
+def _without_bodies(model: object, bodies: frozenset[str]) -> object:
+    """``model``, or a copy whose geoms of ``bodies`` are fully transparent (mjviser skips those)."""
+    if not bodies:
+        return model
+    import copy  # noqa: PLC0415
+
+    shown = copy.copy(model)
+    for g in range(shown.ngeom):
+        if shown.body(shown.geom_bodyid[g]).name in bodies:
+            shown.geom_rgba[g, 3] = 0.0
+    return shown
 
 
 def _hide_geom_groups(scene: object, groups: frozenset[int]) -> None:

@@ -127,12 +127,16 @@ class TestSceneSpawnConfig:
 
 class TestArmCompatibility:
     def test_scene_files_are_written_for_one_arm(self) -> None:
-        assert {scene.written_arms for scene in list_scenes().values()} == {1}
+        # The booth task's file places both WidowX AI arms where they stand in the booth.
+        written = {scene_id: scene.written_arms for scene_id, scene in list_scenes().items()}
+        assert written.pop("booth_task") == 2
+        assert set(written.values()) == {1}
 
     def test_every_tabletop_scene_runs_one_or_two_arms(self) -> None:
         single, bimanual = list_scenes_for_arms(1), list_scenes_for_arms(2)
-        # Floor scenes spawn floating-base robots, never SO-101 arms; bucket_sort is for one Franka FR3.
-        assert set(single) == set(bimanual) == set(list_scenes()) - {"floor_flat", "bucket_sort"}
+        # Floor scenes spawn floating-base robots, never SO-101 arms; bucket_sort is for one Franka FR3,
+        # booth_task for two WidowX AI arms.
+        assert set(single) == set(bimanual) == set(list_scenes()) - {"floor_flat", "bucket_sort", "booth_task"}
         assert get_scene("floor_flat").arm_counts == (1,)
         assert list_scenes_for_arms(3) == {}
 

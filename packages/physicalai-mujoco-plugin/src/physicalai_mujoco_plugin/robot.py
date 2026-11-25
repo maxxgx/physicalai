@@ -219,6 +219,7 @@ class MuJoCoRobot(OperatorControls):
 
             self._cameras.compositor_factory = compositor_factory(appearance)
         self._viewer: ViewerService | None = None
+        self._viewer_background: object | None = None  # the photoreal kit's per-client splat background
         self._http_server: HttpServer | None = None
         self._watcher: SceneXmlWatcher | None = None
         self._scene_edit_deferred = False
@@ -326,15 +327,21 @@ class MuJoCoRobot(OperatorControls):
                 key_callback=self._key_callback,
             )
             if self._appearance is not None:
-                from physicalai_mujoco_plugin.real2sim.appearance import viewer_hidden_groups  # noqa: PLC0415
+                from physicalai_mujoco_plugin.real2sim.appearance import (  # noqa: PLC0415
+                    apply_appearance_look,
+                    viewer_hidden_bodies,
+                    viewer_hidden_groups,
+                )
 
+                apply_appearance_look(sim.model, self._appearance)
                 self._viewer.hidden_geom_groups = viewer_hidden_groups(sim.model, self._appearance)
+                self._viewer.hidden_bodies = viewer_hidden_bodies(self._appearance)
             if not self._viewer.open(sim.model, sim.data):
                 self._viewer, self._enable_viewer = None, False
             elif self._appearance is not None and self._viewer.server is not None:
                 from physicalai_mujoco_plugin.real2sim.appearance import show_splats  # noqa: PLC0415
 
-                show_splats(self._viewer.server, self._appearance)
+                self._viewer_background = show_splats(self._viewer.server, self._appearance, model=sim.model)
         self._cameras.start(sim.model, sim.data)
         self._start_http_server()
 
@@ -532,7 +539,7 @@ class MuJoCoRobot(OperatorControls):
         robots = len(self._sim.bindings) if self._sim is not None else None
         # A custom model's mount frames decide its arm count; registered scenes are laid out for it.
         custom = self._is_custom_xml(xml_path)
-        return load_sim(
+        sim = load_sim(
             xml_path,
             scene,
             self._profile,
@@ -544,6 +551,9 @@ class MuJoCoRobot(OperatorControls):
             robots=robots,
             overview=self._overview,
         )
+        if scene is not None and scene.tune_model is not None:
+            scene.tune_model(sim.model)
+        return sim
 
     def _default_streams(self, sim: Sim) -> list[CameraConfig]:
         """The default streams; with real appearance, capture cameras keep the capture's aspect.

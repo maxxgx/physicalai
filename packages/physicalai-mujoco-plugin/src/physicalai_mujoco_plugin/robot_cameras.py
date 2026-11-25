@@ -267,6 +267,105 @@ def add_cameras(spec: mujoco.MjSpec, cameras: tuple[CameraSpec, ...], profile_na
             msg = f"{where} clashes with a model camera of that name"
             raise ValueError(msg)
         body.add_camera(name=camera.name, pos=list(camera.pos), quat=list(camera.quat), fovy=camera.fovy)
+        if camera.mount_mesh is not None:
+            _add_camera_mount(spec, body, camera.name, camera.mount_mesh)
+            continue
+        if camera.housing is not None:
+            import mujoco  # noqa: PLC0415
+
+            # behind the front face: the camera looks along its -z, so the box extends along +z
+            rotation = np.zeros(9)
+            mujoco.mju_quat2Mat(rotation, np.asarray(camera.quat, dtype=np.float64))
+            back = rotation.reshape(3, 3) @ np.array([0.0, 0.0, camera.housing[2]])
+            body.add_geom(
+                name=f"{camera.name}_housing",
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=list(camera.housing),
+                pos=list(np.asarray(camera.pos) + back),
+                quat=list(camera.quat),
+                contype=0,
+                conaffinity=0,
+                group=2,
+                density=0.0,
+                rgba=[0.12, 0.12, 0.13, 1.0],
+            )
+        if camera.mount_hull is not None:
+            import mujoco  # noqa: PLC0415
+
+            vertices, rgba = camera.mount_hull
+            mesh = spec.add_mesh()
+            mesh.name = f"{camera.name}_mount_hull"
+            mesh.uservert = [float(v) for vertex in vertices for v in vertex]  # no faces: MuJoCo draws the hull
+            body.add_geom(
+                name=f"{camera.name}_mount",
+                type=mujoco.mjtGeom.mjGEOM_MESH,
+                meshname=mesh.name,
+                contype=0,
+                conaffinity=0,
+                group=2,
+                density=0.0,
+                rgba=list(rgba),
+            )
+        elif camera.mount is not None:
+            import mujoco  # noqa: PLC0415
+
+            centre, half, rgba = camera.mount
+            body.add_geom(
+                name=f"{camera.name}_mount",
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=list(half),
+                pos=list(centre),
+                contype=0,
+                conaffinity=0,
+                group=2,
+                density=0.0,
+                rgba=list(rgba),
+            )
+
+
+CAMERA_BODY_PLAN_MARGIN = 0.005
+"""How much larger (m, every way) a camera body's planning proxy is than its collision box."""
+PLAN_PROXY_GROUP = 5
+"""The geom group of planning-only proxies (as :data:`physicalai_mujoco_plugin.bucket_sort_demo.PLAN_PROXY_GROUP`)."""
+
+
+def _add_camera_mount(spec: mujoco.MjSpec, body: object, name: str, mount: object) -> None:
+    """The camera's CAD bracket and its body on *body*: drawn (``<name>_mount``, ``<name>_housing``, group 2), colliding
+    like the body's own collision geoms (``<name>_mount_c<i>``, ``<name>_housing_c``: the same group, contact type,
+    friction and solver settings; massless), with planning proxies (``<name>_mount_plan<i>``; the body's own collision
+    geoms and the camera's box get theirs too, since a body with proxies is planned with its proxies only)."""
+    import mujoco  # noqa: PLC0415
+
+    own = [g for g in body.geoms if g.contype or g.conaffinity]
+    params: dict = {"contype": 1, "conaffinity": 1, "group": 3}
+    if own:
+        t = own[0]
+        params = {"group": t.group, "contype": t.contype, "conaffinity": t.conaffinity, "condim": t.condim,
+                  "friction": list(t.friction), "solref": list(t.solref), "solimp": list(t.solimp), "priority": t.priority,
+                  "margin": t.margin, "gap": t.gap}
+    proxy = {"contype": 0, "conaffinity": 0, "group": PLAN_PROXY_GROUP, "rgba": [0.0, 0.0, 0.0, 0.0], "density": 0.0}
+    k = 0
+    for g in own:   # the body's own collision as its proxies (same shape)
+        extra = {"meshname": g.meshname} if g.type == mujoco.mjtGeom.mjGEOM_MESH else {}
+        body.add_geom(name=f"{name}_mount_plan{k}", type=g.type, size=list(g.size), pos=list(g.pos), quat=list(g.quat), **extra, **proxy)
+        k += 1
+    mesh = spec.add_mesh(name=f"{name}_mount_mesh")
+    mesh.uservert = [float(v) for vertex in mount.vertices for v in vertex]
+    mesh.userface = [int(i) for face in mount.faces for i in face]
+    body.add_geom(name=f"{name}_mount", type=mujoco.mjtGeom.mjGEOM_MESH, meshname=mesh.name, contype=0, conaffinity=0, group=2,
+                  density=0.0, rgba=list(mount.rgba))
+    for i, pts in enumerate(mount.pieces):
+        piece = spec.add_mesh(name=f"{name}_mount_c{i}", uservert=[float(v) for p in pts for v in p])
+        body.add_geom(name=f"{name}_mount_c{i}", type=mujoco.mjtGeom.mjGEOM_MESH, meshname=piece.name, density=0.0, rgba=[0.5, 0.3, 0.2, 0.3], **params)
+    for pts in mount.proxies:
+        hull = spec.add_mesh(name=f"{name}_mount_plan{k}", uservert=[float(v) for p in pts for v in p])
+        body.add_geom(name=f"{name}_mount_plan{k}", type=mujoco.mjtGeom.mjGEOM_MESH, meshname=hull.name, **proxy)
+        k += 1
+    box = {"type": mujoco.mjtGeom.mjGEOM_BOX, "size": list(mount.body_half), "pos": list(mount.body_pos), "quat": list(mount.body_quat)}
+    body.add_geom(name=f"{name}_housing", contype=0, conaffinity=0, group=2, density=0.0, rgba=list(mount.body_rgba), **box)
+    body.add_geom(name=f"{name}_housing_c", density=0.0, rgba=[0.1, 0.1, 0.1, 0.3], **box, **params)
+    # its proxy 5 mm larger every way (r15: the box alone let plans graze bucket rims; the housing's proxies reach 6 mm)
+    body.add_geom(name=f"{name}_mount_plan{k}", **{**box, "size": [h + CAMERA_BODY_PLAN_MARGIN for h in mount.body_half]}, **proxy)
 
 
 def check_camera_names(spec: mujoco.MjSpec, where: object) -> None:

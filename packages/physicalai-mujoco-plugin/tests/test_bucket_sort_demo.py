@@ -169,15 +169,25 @@ class TestGrasp:
             assert point[2] >= bd.MIN_TCP_Z
             np.testing.assert_allclose(point[:2], position[:2], atol=1e-9)
 
-    def test_rolled_resistor_is_still_graspable_but_one_on_end_is_not(self, scene: MuJoCoRobot) -> None:
-        shape = _demo(scene).planner.shapes["resistor"]
+    def test_rolled_resistor_is_graspable_and_so_is_one_on_end_but_not_one_leaning(self, scene: MuJoCoRobot) -> None:
+        planner = _demo(scene).planner
+        shape = planner.shapes["resistor"]
         _place(scene, "resistor", (0.35, 0.0), 0.4, roll=1.0)
         rotation = scene._sim.data.xmat[scene._sim.model.body("resistor").id].reshape(3, 3)
         axes = shape.grasp_axes(rotation)
         assert axes is not None
         assert axes[2] < bd.GRIP_OPEN
+        # standing on its end (as real resistors do): grasped across its round body, at any heading
         standing = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])  # long axis vertical
-        assert shape.grasp_axes(standing) is None
+        closing, _, width = shape.grasp_axes(standing)
+        assert closing[2] == 0.0
+        assert width == pytest.approx(2.0 * shape.half[0])   # across the body, not along it
+        assert planner.standing("resistor", standing)
+        assert planner.grasp_period("resistor", standing) == pytest.approx(np.pi / 6)
+        # leaning about 45 deg: neither lying nor standing, not grasped
+        c, s_ = np.cos(np.pi / 4), np.sin(np.pi / 4)
+        leaning = np.array([[1.0, 0.0, 0.0], [0.0, c, -s_], [0.0, s_, c]])
+        assert shape.grasp_axes(leaning) is None
 
     def test_two_symmetric_yaws_half_a_turn_apart_nearest_first(self, scene: MuJoCoRobot) -> None:
         planner = _demo(scene).planner

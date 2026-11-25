@@ -63,13 +63,22 @@ import numpy as np
 from loguru import logger
 
 from physicalai_mujoco_plugin.bucket_sort import (
-    BUCKET_COLORS,
     BUCKET_INTERIOR,
     DEFAULT_LAYOUT,
     OBJECT_Y,
-    OBJECTS,
+    bucket_colors,
     bucket_containing,
+    scene_objects,
 )
+from physicalai_mujoco_plugin.bucket_sort_objects import grasp_period
+from physicalai_mujoco_plugin.robot_cameras import CAMERA_BODY_PLAN_MARGIN
+
+_PROXY_NAME = __import__("re").compile(r"_plan\d+$|_pc\d+_\d+$")
+_HULL_NAME = __import__("re").compile(r"_hull\d+$")
+
+PLAN_PROXY_GROUP = 5
+"""Geom group of planning-only proxies (``<body>_plan<i>``, ``<bucket>_pc<k>_<j>``; profiles/rebot_b601.py, the
+bucket-v2 scene): the clearance checks use them instead of a body's collision geoms."""
 from physicalai_mujoco_plugin.bucket_sort_arms import (
     FR3_ARM,
     FRANKA_GRIP_OPEN,
@@ -81,7 +90,7 @@ from physicalai_mujoco_plugin.bucket_sort_arms import (
 FrankaArm = BucketSortArm
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from physicalai_mujoco_plugin.bucket_sort import BucketSortTask, Instruction
 
@@ -126,10 +135,13 @@ CLEARANCE = {
     "held_bucket": 0.010,
     "held_objects": 0.008,
     "arm": 0.03,
+    "target": -1.0,
 }
 """Smallest planned distance, in metres, from the robot (or the object it holds) to each kind of obstacle.
 
-``arm`` is the working arm's distance from another arm that holds still (the Duo's)."""
+``arm`` is the working arm's distance from another arm that holds still (the Duo's). ``target`` (r17, D4 T6): the hand's
+distance from the object it is about to grasp while it approaches and descends, before the close (a finger grazing it
+there pushed its neighbours); -1 m: measured, not a budget (the scene's numeric ``r2s_target_descent_m`` sets one)."""
 IK_POS_TOL = 0.003
 IK_ROT_TOL = float(np.radians(2.0))
 SHOULDER_SINGULAR_WIDTH = 0.3
@@ -158,7 +170,12 @@ HELD_DISTANCE = 0.045
 SETTLE_TIMEOUT_S = 10.0
 """Give up on an object that does not come to rest within this long."""
 SETTLE_CHECK_S = 1.2
-"""After returning home, wait this long for the placed object to come to rest before judging it."""
+"""The longest the demonstrator waits after an attempt for the placed object to rest before judging it (r16: a bound;
+the judgement comes as soon as it rests)."""
+BETWEEN_PAUSE_S = 0.0
+"""The pause before the next object's attempt (instead of :attr:`DemoParams.start_pause_s`). r16 (D4, D7): none; the
+attempt waits only on state (the next object resting, the pile still); r11-r15 waited a fixed 0.2 s, twice per object
+once the transit came in."""
 CATCH_UP_S = 1.5
 """At the end of a plan, wait at most this long for the arm to reach its last target."""
 STALL_ERROR = 0.3
@@ -225,7 +242,7 @@ Phase = Literal[
     "stalled",
 ]
 Outcome = Literal["running", "success", "failed", "stalled"]
-PlanKind = Literal["attempt", "place", "home"]
+PlanKind = Literal["attempt", "place", "home", "transit"]
 """A whole attempt (pick, place, home), the rest of one with the object in the hand, or the way home."""
 
 
@@ -240,6 +257,10 @@ class DemoParams:
 
     start_pause_s: float = 0.6
     """Wait after the episode starts, for the objects to settle."""
+    go_home: bool = True
+    """Whether an attempt ends with the way home. ``False`` while other objects of a kind-level instruction are still
+    to be sorted: the attempt ends straight above the bucket and the next one starts there (r11: a several-object
+    episode spent ~5 s per object going home and waiting)."""
     transit_speed: float = 0.42
     """Peak hand speed of the long moves (approach, carry, return), m/s."""
     fine_speed: float = 0.12
@@ -282,6 +303,19 @@ class DemoParams:
     release_yaw_noise: float = 0.0
     yaw_choice: float = 0.5
     """Uniform draw that picks between two grasp yaws whose plans are about as good."""
+    close_drift_mps: float = 0.0
+    """r15 (operator drift, :func:`operator_drift`): once the fingers hold the object, the hand starts rising at this
+    speed through the rest of the close and the settle, instead of standing still (0: it stands still)."""
+    release_creep_mps: float = 0.0
+    """The hand keeps sinking at this speed during :attr:`release_pause_s` (at most :data:`RELEASE_CREEP_MAX_M`)."""
+    release_rise_mps: float = 0.0
+    """Once the opening fingers clear the object, the hand rises at this speed through :attr:`after_release_s`."""
+    motion_ramp: float | None = None
+    """r18 (D7, :func:`operator_timing`): the scripted moves' speed profile (:func:`move_progress`); ``None``: minimum jerk."""
+    release_open_mps: float | None = None
+    """r18: the release's finger opening speed (m/s of width); ``None``: a fixed 0.45 s opening (r1-r17)."""
+    arrive_wait_s: float = 0.1
+    """How long a plan's last target stands before the arm counts as arrived (joints within 0.02 rad of it; r1-r17 0.1 s)."""
 
     @classmethod
     def for_heights(cls, heights: Heights = FRANKA_HEIGHTS) -> DemoParams:
@@ -350,17 +384,43 @@ def min_jerk(s: np.ndarray | float) -> np.ndarray:
     return s**3 * (10.0 - 15.0 * s + 6.0 * s * s)
 
 
-def move_duration(distance: float, peak_speed: float, minimum: float = 0.3, peak_accel: float | None = None) -> float:
-    """Return how long a minimum-jerk move of *distance* takes at a peak speed of *peak_speed*.
+MIN_JERK_PHASES = frozenset({"descend", "close", "lower", "release"})
+"""r18: the moves that end at or near a contact keep minimum jerk under a ramped profile (DemoParams.motion_ramp): the hand
+comes down onto the object, the fingers close and the object is lowered into the bucket and let go as in r1-r17 (a ramped
+descent is still 10 % above the bottom at 80 % of its time, against 5.8 %, and the fingers' early close is timed for the
+latter: default 31026, a finger 12 mm into a battery). Free-space moves ramp: approach, lift, carry, retreat, return, home."""
 
-    Its peak speed is 1.875 times its mean speed, and its peak acceleration ``5.77 distance / T^2``.
+
+def move_progress(s: np.ndarray | float, ramp: float | None = None) -> np.ndarray:
+    """A scripted move's progress (0..1) at normalised time *s* (r18, D7): minimum jerk (*ramp* ``None``, r1-r17, ~17 % of
+    every move below a tenth of its peak speed), or the operator-like profile: a smooth (quintic) speed ramp over the share
+    *ramp* of the move at each end and a constant speed between (:attr:`DemoParams.motion_ramp`)."""
+    if ramp is None or ramp >= 0.5:  # noqa: PLR2004 - a half-and-half ramp is minimum jerk's shape
+        return min_jerk(s)
+    s = np.clip(np.asarray(s, dtype=float), 0.0, 1.0); vc = 1.0 / (1.0 - ramp)
+    area = lambda x: 2.5 * x**4 - 3.0 * x**5 + x**6   # noqa: E731 - the integral of the smoothstep 10x^3-15x^4+6x^5
+    return np.where(s < ramp, vc * ramp * area(np.clip(s / ramp, 0, 1)),
+                    np.where(s > 1.0 - ramp, 1.0 - vc * ramp * area(np.clip((1.0 - s) / ramp, 0, 1)), vc * (0.5 * ramp + (s - ramp))))
+
+
+def move_duration(distance: float, peak_speed: float, minimum: float = 0.3, peak_accel: float | None = None,
+                  ramp: float | None = None) -> float:
+    """Return how long a move of *distance* takes at a peak speed of *peak_speed*, in the profile *ramp*
+    (:func:`move_progress`).
+
+    Minimum jerk: its peak speed is 1.875 times its mean speed, its peak acceleration ``5.77 distance / T^2``. The ramped
+    profile (r18, the arm's moves; the fingers keep minimum jerk): ``1 / (1 - r)`` times the mean speed and ``1.875 / (r (1 - r)) distance / T^2`` (r = 0.25: 1.33 and 10).
 
     Returns:
         The duration in seconds, at least *minimum*, and long enough to stay under *peak_accel*.
     """
-    duration = max(minimum, 1.875 * abs(distance) / peak_speed)
+    if ramp is None or ramp >= 0.5:  # noqa: PLR2004 - move_progress is minimum jerk there
+        speed_k, accel_k = 1.875, 5.77
+    else:
+        speed_k, accel_k = 1.0 / (1.0 - ramp), 1.875 / (ramp * (1.0 - ramp))
+    duration = max(minimum, speed_k * abs(distance) / peak_speed)
     if peak_accel is not None:
-        duration = max(duration, float(np.sqrt(5.77 * abs(distance) / peak_accel)))
+        duration = max(duration, float(np.sqrt(accel_k * abs(distance) / peak_accel)))
     return duration
 
 
@@ -374,6 +434,8 @@ class _Move:
     """The state ``(x, y, z, yaw, grip, tilt)`` the script reaches once this move (and those before it) end."""
     q_delta: np.ndarray | None = None
     """Change of the joint-space reference posture over this move (see :meth:`Planner.solve`)."""
+    ramp: float | None = None
+    """r18: this move's speed profile (:func:`move_progress`; ``None``: minimum jerk)."""
 
 
 class MotionScript:
@@ -390,6 +452,7 @@ class MotionScript:
         The tilt (how far the hand leans outward, :func:`lean`) is in the state only when *start* has it.
         """
         self.slow = dict(slow or {})
+        self.ramp: float | None = None   # r18: the moves' speed profile (move_progress), from DemoParams.motion_ramp
         self.start = np.asarray(start, dtype=np.float64).copy()
         self.end = self.start.copy()
         self.moves: list[_Move] = []
@@ -431,7 +494,8 @@ class MotionScript:
         t0 = self.t_end
         if last is not None and blend > 0.0 and np.any(last.delta):
             t0 = max(last.t0, self.t_end - blend * last.duration)
-        self.moves.append(_Move(phase, t0, float(duration), target - self.end, target.copy()))
+        ramp = None if phase in MIN_JERK_PHASES else self.ramp
+        self.moves.append(_Move(phase, t0, float(duration), target - self.end, target.copy(), ramp=ramp))
         self.end = target
         self.t_end = max(self.t_end, t0 + float(duration))
 
@@ -447,7 +511,11 @@ class MotionScript:
         state = np.repeat(self.start[None, :], len(t), axis=0)
         for move in self.moves:
             if np.any(move.delta):
-                state += min_jerk((t - move.t0) / move.duration)[:, None] * move.delta[None, :]
+                x = (t - move.t0) / move.duration
+                step = move_progress(x, move.ramp)[:, None] * move.delta[None, :]
+                if move.ramp is not None:   # r18: the fingers keep minimum jerk (they slow into a contact); the arm ramps
+                    step[:, 4] = min_jerk(x) * move.delta[4]
+                state += step
         return state
 
     def reference(self, t: np.ndarray, q_start: np.ndarray) -> np.ndarray:
@@ -459,7 +527,7 @@ class MotionScript:
         ref = np.repeat(np.asarray(q_start, dtype=np.float64)[None, :], len(t), axis=0)
         for move in self.moves:
             if move.q_delta is not None and np.any(move.q_delta):
-                ref += min_jerk((t - move.t0) / move.duration)[:, None] * move.q_delta[None, :]
+                ref += move_progress((t - move.t0) / move.duration, move.ramp)[:, None] * move.q_delta[None, :]
         return ref
 
     def phases(self, t: np.ndarray) -> list[Phase]:
@@ -618,6 +686,237 @@ class _PlanJob:
         finally:
             _planning.job = None
             self.done.set()
+
+
+class _WorkerJob:
+    """The planning worker's stand-in for :class:`_PlanJob`: :func:`_checkpoint` stops a cancelled plan."""
+
+    def __init__(self, flag: object) -> None:
+        self._flag = flag
+
+    def checkpoint(self) -> None:
+        if self._flag.value:
+            raise PlanCancelledError
+
+
+def _plan_transit_core(planner: Planner, snapshot: SceneSnapshot, start: tuple, q: np.ndarray, target: str, bucket: str,
+                       params: DemoParams, dt: float) -> JointPlan:
+    """r16 transit (BucketSortDemonstrator._plan_and_run_transit): a collision-checked move over *target* at the carry
+    height, as a function of its inputs only (r17: so the planning worker can make it; no random draws)."""
+    planner.load(snapshot)
+    position, _ = planner.object_pose(target)
+    here = np.asarray(start[:3], dtype=np.float64)
+    over = np.array([position[0], position[1], max(float(params.carry_z), float(here[2]))])
+
+    def build(slow: dict[str, float]) -> tuple[MotionScript, float]:
+        script = MotionScript(start, slow)
+        script.ramp = params.motion_ramp
+        yaw = float(start[3])
+        tilt = None if planner.ik.plain else planner.tilt_at(over, yaw)
+        script.add("approach", pos=over, duration=max(move_duration(float(np.linalg.norm(over - here)), params.transit_speed, 0.8, ramp=params.motion_ramp),
+                                                      move_duration((tilt or 0.0) - script.end_tilt, params.yaw_speed, 0.8, ramp=params.motion_ramp)), tilt=tilt)
+        return script, yaw
+
+    go_home = getattr(planner, "_go_home", True); planner._go_home = False   # no way home: the attempt follows
+    try:
+        return planner.checked(build, q, dt, kind="transit", target=target, bucket=bucket)
+    finally:
+        planner._go_home = go_home
+
+
+def _plan_worker_main(conn: object, model: object, arms: tuple, flag: object) -> None:
+    """The planning worker: its own planners on its own copy of the model; one attempt plan per request."""
+    import os  # noqa: PLC0415
+
+    parent = os.getppid()
+    planners = tuple(Planner(model, arm, tuple(o for o in arms if o is not arm)) for arm in arms)
+    _planning.job = _WorkerJob(flag)
+    while True:
+        try:
+            # wake every second: a parent that died without closing us (SIGTERM, SIGKILL) leaves the pipe open on some
+            # systems; an orphan is re-parented (to launchd on macOS), so a changed parent pid also ends the worker
+            while not conn.poll(1.0):
+                if os.getppid() != parent:
+                    return
+            msg = conn.recv()
+        except (EOFError, OSError):
+            return
+        if msg is None:
+            return
+        if msg[0] == "transit":   # r17: the transit too (it held the GIL on a thread: physics at 0.82 x real time)
+            _, job_id, active, snapshot, q, start, target, bucket, params, dt, geom_bits = msg
+            try:
+                model.geom_contype[:], model.geom_conaffinity[:], model.geom_group[:] = geom_bits
+                reply = (job_id, "ok", _plan_transit_core(planners[active], snapshot, start, q, target, bucket, params, dt), None)
+            except PlanCancelledError:
+                reply = (job_id, "cancelled", None, None)
+            except Exception as exc:  # noqa: BLE001 - reported to the demonstrator, which plans itself then
+                reply = (job_id, "error", repr(exc), None)
+            finally:
+                flag.value = 0
+            try:
+                conn.send(reply)
+            except (BrokenPipeError, OSError):
+                return
+            continue
+        (job_id, active, snapshot, q, start, instruction, params, dt, rng_state, geom_bits) = msg
+        try:
+            contype, conaffinity, group = geom_bits
+            model.geom_contype[:], model.geom_conaffinity[:], model.geom_group[:] = contype, conaffinity, group
+            rng = None
+            if rng_state is not None:
+                rng = np.random.default_rng(); rng.bit_generator.state = rng_state
+            arm = arms[active]
+            plan = _plan_attempt_core(planners[active], arm, len(arms) > 1 or arm.max_tilt > 0.0, snapshot, q, start,
+                                      instruction, params, dt, rng)
+            try:
+                conn.send((job_id, "ok", plan, None if rng is None else rng.bit_generator.state))
+            except (BrokenPipeError, OSError):
+                return   # the demonstrator is gone
+        except PlanCancelledError:
+            reply = (job_id, "cancelled", None, None)
+        except Exception as exc:  # noqa: BLE001 - reported to the demonstrator, which plans itself then
+            reply = (job_id, "error", repr(exc), None)
+        else:
+            reply = None
+        finally:
+            flag.value = 0
+        if reply is not None:
+            try:
+                conn.send(reply)
+            except (BrokenPipeError, OSError):
+                return   # the demonstrator is gone
+
+
+class _PlanProcess:
+    """Attempt planning in a process of its own (:meth:`BucketSortDemonstrator.plan_attempt`).
+
+    Planning is seconds of short Python and NumPy calls that hold the GIL; on a planning thread it still shares the
+    interpreter with the control loop and the camera streams, which slow down for as long as it runs. Here the
+    planning thread only waits on a pipe (the GIL released) while the worker plans on its own copy of the model. The
+    worker gets the model's mutable contact bits with every request; the episode's generator state goes there and
+    comes back, so a plan and the draws after it are the same as planned in-process. Any failure of the worker falls
+    back to planning in-process.
+    """
+
+    def __init__(self, model: object, arms: tuple) -> None:
+        import multiprocessing as mp  # noqa: PLC0415
+
+        # "spawn" on every platform (macOS's default too): a fresh interpreter, never a fork of a process that holds
+        # OpenGL contexts, threads and the camera workers' pipes
+        ctx = mp.get_context("spawn")
+        self._flag = ctx.Value("b", 0)
+        self._conn, child = ctx.Pipe()
+        # r18 (5(a)): with PLAN_PARALLEL the worker starts its own candidate pool, which a daemonic process may not; it then
+        # is not a daemon, and is closed at exit (it also ends when its parent goes, below)
+        daemon = PLAN_PARALLEL <= 0
+        self._proc = ctx.Process(target=_plan_worker_main, args=(child, model, arms, self._flag), name="bucket-sort-plan-worker", daemon=daemon)
+        self._proc.start()
+        child.close()
+        if not daemon:
+            import atexit  # noqa: PLC0415
+            import weakref  # noqa: PLC0415
+
+            atexit.register(_PlanProcess._close_at_exit, weakref.ref(self))
+        self._next = 0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _close_at_exit(ref: object) -> None:
+        self = ref()
+        if self is None or not self._proc.is_alive():
+            return
+        try:
+            self._flag.value = 1
+            self._conn.send(None)
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        self._proc.join(2.0)
+        if self._proc.is_alive():
+            self._proc.terminate()
+
+    @property
+    def alive(self) -> bool:
+        return self._proc.is_alive()
+
+    @property
+    def pid(self) -> int | None:
+        """The worker's process id."""
+        return self._proc.pid
+
+    def plan_transit(self, active, snapshot, q, start, target, bucket, params, dt, model) -> JointPlan | None:  # noqa: ANN001, PLR0913
+        """r17: the transit planned in the worker; ``None`` when it cannot (the caller plans itself)."""
+        with self._lock:
+            if not self.alive:
+                return None
+            self._next += 1; job_id = self._next
+            bits = (np.array(model.geom_contype), np.array(model.geom_conaffinity), np.array(model.geom_group))
+            try:
+                self._conn.send(("transit", job_id, active, snapshot, q, start, target, bucket, params, dt, bits))
+            except (BrokenPipeError, OSError):
+                return None
+            while True:
+                if self._conn.poll(0.02):
+                    try:
+                        rid, status, plan, _ = self._conn.recv()
+                    except (EOFError, OSError):
+                        return None
+                    if rid != job_id:
+                        continue
+                    if status == "cancelled":
+                        raise PlanCancelledError
+                    if status != "ok":
+                        logger.warning("Demonstrator: the planning worker failed a transit ({}); planning here", plan)
+                        return None
+                    return plan
+                _checkpoint()
+
+    def plan_attempt(self, active, snapshot, q, start, instruction, params, dt, rng, model) -> JointPlan | None:  # noqa: ANN001, PLR0913
+        """Plan in the worker; ``None`` when it cannot (dead, or an error): the caller plans itself.
+
+        Raises:
+            PlanCancelledError: When the calling plan job is cancelled meanwhile.
+        """
+        with self._lock:
+            if not self.alive:
+                return None
+            self._next += 1; job_id = self._next
+            bits = (np.array(model.geom_contype), np.array(model.geom_conaffinity), np.array(model.geom_group))
+            try:
+                self._conn.send((job_id, active, snapshot, q, start, instruction, params, dt,
+                                 None if rng is None else rng.bit_generator.state, bits))
+            except (BrokenPipeError, OSError):
+                return None
+            while True:
+                if self._conn.poll(0.02):
+                    try:
+                        rid, status, plan, rng_state = self._conn.recv()
+                    except (EOFError, OSError):
+                        return None
+                    if rid != job_id:
+                        continue
+                    if status == "cancelled":
+                        raise PlanCancelledError
+                    if status != "ok":
+                        logger.warning("Demonstrator: the planning worker failed ({}); planning here", plan)
+                        return None
+                    if rng is not None and rng_state is not None:
+                        rng.bit_generator.state = rng_state
+                    return plan
+                job = getattr(_planning, "job", None)
+                if job is not None and getattr(job, "cancelled", False):
+                    self._flag.value = 1   # the worker stops at its next checkpoint and answers "cancelled"
+                if not self.alive:
+                    return None
+
+    def close(self) -> None:
+        try:
+            self._conn.send(None)
+        except (BrokenPipeError, OSError):
+            pass
+        self._proc.join(2.0)
+        if self._proc.is_alive():
+            self._proc.terminate()
 
 
 class FrankaIK:
@@ -826,6 +1125,45 @@ class FrankaIK:
         Returns:
             ``(q, position error in m, orientation error in rad)``.
         """
+        cache = getattr(self, "_solve_cache", None)
+        key = None
+        if cache is not None:   # an attempt plan solves the same pose from the same seed many times (r10: 48 %)
+            key = (np.asarray(q0, dtype=np.float64).tobytes(), np.asarray(pos, dtype=np.float64).tobytes(), float(yaw), iters,
+                   None if posture is None else np.asarray(posture, dtype=np.float64).tobytes(), posture_gain, limit_gain,
+                   null_step, tol, float(tilt))
+            hit = cache.get(key)
+            if hit is not None:
+                # the solver leaves its data at the kinematics of the joints it returns, and callers read it
+                self.data.qpos[self.qpos_adr] = hit[0]
+                self._mujoco.mj_kinematics(self.model, self.data)
+                self._mujoco.mj_comPos(self.model, self.data)
+                return hit[0].copy(), hit[1], hit[2]
+        result = self._solve(q0, pos, yaw, iters=iters, posture=posture, posture_gain=posture_gain, limit_gain=limit_gain,
+                             null_step=null_step, tol=tol, tilt=tilt)
+        if key is not None and len(cache) < SOLVE_CACHE_MAX:
+            cache[key] = (result[0].copy(), result[1], result[2])
+        return result
+
+    def solve_cache(self, on: bool) -> None:  # noqa: FBT001
+        """Remember :meth:`solve`'s results (exact inputs -> exact outputs) while *on*; cleared either way. Plain
+        kinematics, no scene: the same inputs always give the same joints, so a remembered one is the one it would solve."""
+        self._solve_cache = {} if on else None
+
+    def _solve(  # noqa: PLR0914 - one numerical routine; splitting it hides the algorithm
+        self,
+        q0: np.ndarray,
+        pos: np.ndarray,
+        yaw: float,
+        *,
+        iters: int = 6,
+        posture: np.ndarray | None = None,
+        posture_gain: float = 0.5,
+        limit_gain: float = 0.0,
+        null_step: float = 0.05,
+        tol: float = 2e-5,
+        tilt: float = 0.0,
+    ) -> tuple[np.ndarray, float, float]:
+        """:meth:`solve` without its memory."""
         mujoco, model, data = self._mujoco, self.model, self.data
         q = np.clip(np.asarray(q0, dtype=np.float64).copy(), self.lower, self.upper)
         r_des = self.target_rotation(pos, yaw, tilt)
@@ -933,6 +1271,10 @@ class ObjectShape:
 
     half: np.ndarray
     """Half extents along the body's x, y and z."""
+    round_width: float | None = None
+    """For a body round about its long side (cylinders along it, the resistor): its diameter where the hand closes,
+    at the middle (the resistor's waist). Two pads close on a round body at its diameter whatever it has rolled to or
+    whatever the heading, so the width the hand closes on is this, not the box's projection."""
 
     @property
     def long_axis(self) -> int:
@@ -956,11 +1298,27 @@ class ObjectShape:
         """
         along = rotation[:, self.long_axis].copy()
         if abs(float(along[2])) > 0.35:  # noqa: PLR2004 - standing on end, or nearly
-            return None
+            # A squat object (a cube, a cylinder, a cross) lies on another face as well: grasp it across
+            # its widest level side instead. An elongated one (the resistor) standing on end is not grasped.
+            others = sorted(float(h) for i, h in enumerate(self.half) if i != self.long_axis)
+            if self.half_length > 1.3 * others[-1]:  # noqa: PLR2004
+                if abs(float(along[2])) < 0.85:  # noqa: PLR2004 - leaning: neither lying nor standing
+                    return None
+                # standing on its end (the real resistors stand about one in five): grasped from above across its
+                # round body at any heading (:meth:`BucketSortPlanner.grasp_period`); the axis here is just one of them
+                closing = np.array([1.0, 0.0, 0.0])
+                width = float(2.0 * np.sum(self.half * np.abs(rotation.T @ closing))) if self.round_width is None else self.round_width
+                return closing, np.array([0.0, 1.0, 0.0]), width
+            level = [i for i in range(3) if abs(float(rotation[2, i])) <= 0.35]  # noqa: PLR2004
+            if not level:
+                return None
+            along = rotation[:, max(level, key=lambda i: float(self.half[i]))].copy()
         along[2] = 0.0
         along /= np.linalg.norm(along)
         closing = np.array([-along[1], along[0], 0.0])
         width = float(2.0 * np.sum(self.half * np.abs(rotation.T @ closing)))
+        if self.round_width is not None and abs(float(rotation[2, self.long_axis])) <= 0.35:  # noqa: PLR2004 - lying
+            width = self.round_width
         return closing, along, width
 
 
@@ -975,15 +1333,32 @@ def object_shape(model: object, name: str) -> ObjectShape:
     body = int(model.body(name).id)
     lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
     rotation = np.zeros(9)
+    cylinders = []
     for geom in np.flatnonzero(np.asarray(model.geom_bodyid) == body):
-        if int(model.geom_contype[geom]) == 0 and int(model.geom_conaffinity[geom]) == 0:
+        geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(geom)) or ""
+        if _PROXY_NAME.search(geom_name):
+            continue   # r14 planning proxies: not the object's shape
+        # a collision geom (named <body>_hull<i>; while parked its contacts may be off, r14) or any other colliding geom
+        if int(model.geom_contype[geom]) == 0 and int(model.geom_conaffinity[geom]) == 0 and not _HULL_NAME.search(geom_name):
             continue
-        mesh = int(model.geom_dataid[geom])
-        start, count = int(model.mesh_vertadr[mesh]), int(model.mesh_vertnum[mesh])
         mujoco.mju_quat2Mat(rotation, model.geom_quat[geom])
-        points = model.mesh_vert[start : start + count] @ rotation.reshape(3, 3).T + model.geom_pos[geom]
+        mesh = int(model.geom_dataid[geom])
+        if int(model.geom_type[geom]) == int(mujoco.mjtGeom.mjGEOM_MESH) and mesh >= 0:
+            start, count = int(model.mesh_vertadr[mesh]), int(model.mesh_vertnum[mesh])
+            local = model.mesh_vert[start : start + count]
+        else:   # a primitive (the resistor's cap / waist cylinders): its own bounding box (geom_dataid is -1 there)
+            corners = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], dtype=np.float64)
+            local = model.geom_aabb[geom, :3] + corners * model.geom_aabb[geom, 3:]
+        points = local @ rotation.reshape(3, 3).T + model.geom_pos[geom]
         lo, hi = np.minimum(lo, points.min(axis=0)), np.maximum(hi, points.max(axis=0))
-    return ObjectShape(half=(hi - lo) / 2.0)
+        if int(model.geom_type[geom]) == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
+            cylinders.append((rotation.reshape(3, 3)[:, 2].copy(), np.asarray(model.geom_pos[geom], dtype=float), float(model.geom_size[geom, 0])))
+    shape = ObjectShape(half=(hi - lo) / 2.0)
+    if cylinders and all(abs(axis[shape.long_axis]) > 0.999 for axis, _, _ in cylinders):  # noqa: PLR2004 - all along the long side
+        centre = (hi + lo) / 2.0
+        middle = min(cylinders, key=lambda c: abs(float(c[1][shape.long_axis] - centre[shape.long_axis])))
+        shape = ObjectShape(half=shape.half, round_width=2.0 * middle[2])
+    return shape
 
 
 class _Clearance:
@@ -1001,17 +1376,41 @@ class _Clearance:
         self.model = model
         self.data = data
 
-        def collision_geoms(body_names: tuple[str, ...]) -> np.ndarray:
-            bodies = [int(model.body(name).id) for name in body_names]
-            return np.array([
-                g
-                for g in range(model.ngeom)
-                if int(model.geom_bodyid[g]) in bodies and (model.geom_contype[g] or model.geom_conaffinity[g])
-            ])
+        names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or "" for g in range(model.ngeom)]
+
+        proxy_name = __import__("re").compile(r"_plan\d+$|_pc\d+_\d+$")
+
+        def is_proxy(g: int) -> bool:   # r14 planning-only proxies, by name (<body>_plan<i>, <bucket>_pc<k>_<j>): their
+            return bool(proxy_name.search(names[g]))   # group and contact bits change (compositor, parking on the shelf)
+
+        def collision_geoms(body_names: tuple[str, ...], *, use_proxies: bool = True) -> np.ndarray:
+            """Per body its planning proxies if it has any (each the hull of whole collision pieces: they contain the
+            collision, so clearing them clears it; far fewer to check), else its collision geoms."""
+            out = []
+            for name in body_names:
+                b = int(model.body(name).id)
+                body_geoms = [g for g in range(model.ngeom) if int(model.geom_bodyid[g]) == b]
+                proxies = [g for g in body_geoms if is_proxy(g)] if use_proxies else []
+                out += proxies if proxies else [g for g in body_geoms if (model.geom_contype[g] or model.geom_conaffinity[g]) and not is_proxy(g)]
+            return np.array(out, dtype=int)
+
+        # a bucket content item's proxies count while the item is shown (bucket fill: its key collision geom has contact)
+        key_of = {}
+        for g in range(model.ngeom):
+            n = names[g]
+            if is_proxy(g) and "_pc" in n:
+                head, rest = n.split("_pc", 1)
+                key = f"{head}_item{rest.split('_', 1)[0]}"
+                key_of[g] = int(model.geom(key).id) if key in names else -1
+        self._content_key = key_of
+        self._buckets_by_fill: dict[bytes, np.ndarray] = {}
+        self._bucket_keys: np.ndarray | None = None
 
         hand = tuple(arm.name(body) for body in arm.hand_bodies)
         self.robot = collision_geoms((*hand, *(arm.name(link) for link in reversed(arm.links))))
-        self.fingers = collision_geoms(tuple(arm.name(body) for body in arm.finger_bodies))
+        # the fingers against the table set how low a grasp goes: their fine pieces (few pairs; a proxy's extra reach
+        # would lift every grasp)
+        self.fingers = collision_geoms(tuple(arm.name(body) for body in arm.finger_bodies), use_proxies=False)
         # The base (link 0) never moves: its distance from another arm's base is the mount's.
         moving = tuple(arm.name(link) for link in arm.arm_links[1:])
         self.arm = collision_geoms((*hand, *moving)) if others else None
@@ -1020,22 +1419,85 @@ class _Clearance:
             if others
             else None
         )
-        self.buckets = collision_geoms(tuple(f"bucket_{color}" for color in BUCKET_COLORS))
-        self.objects = {name: collision_geoms((name,)) for name in OBJECTS}
+        self.buckets = collision_geoms(tuple(f"bucket_{color}" for color in bucket_colors(model)))
+        self.objects = {name: collision_geoms((name,)) for name in scene_objects(model)}
         self.table = np.array([int(model.geom("table_top").id)])
         self._fromto = np.zeros(6)
+        self._body_radius: dict[int, float] = {}
+        self._group_bodies: dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._others: dict[str, np.ndarray] = {}
+
+    def _near_bodies(self, group_a: np.ndarray, group_b: np.ndarray, cap: float) -> tuple[np.ndarray, np.ndarray]:
+        """*group_a* and *group_b* cut to the geoms of bodies whose bounding spheres (each body's geoms about its
+        origin, rigid, so computed once) come within *cap* of each other (r13: hundreds of small collision pieces per
+        bucket and hand, so the pairwise test runs on the near bodies only)."""
+        data, model = self.data, self.model
+        out = []
+        for group in (group_a, group_b):
+            key = (id(group), len(group))
+            cached = self._group_bodies.get(key)
+            if cached is None or cached[0] is not group:
+                bodies = np.asarray(model.geom_bodyid[group]); cached = (group, bodies, np.unique(bodies))
+                self._group_bodies[key] = cached
+            bodies = cached[1]
+            for b in cached[2]:
+                if int(b) not in self._body_radius:   # over ALL the body's collision geoms: valid for any subset of them
+                    g = np.flatnonzero((np.asarray(model.geom_bodyid) == b) & ((np.asarray(model.geom_contype) != 0) | (np.asarray(model.geom_conaffinity) != 0)))
+                    g = g if len(g) else group[bodies == b]
+                    self._body_radius[int(b)] = float((np.linalg.norm(data.geom_xpos[g] - data.xpos[b], axis=1) + model.geom_rbound[g]).max())
+            out.append(bodies)
+        ba, bb = out
+        ua, ub = self._group_bodies[(id(group_a), len(group_a))][2], self._group_bodies[(id(group_b), len(group_b))][2]
+        ca, cb = data.xpos[ua], data.xpos[ub]
+        ra = np.array([self._body_radius[int(b)] for b in ua]); rb = np.array([self._body_radius[int(b)] for b in ub])
+        gap = np.linalg.norm(ca[:, None, :] - cb[None, :, :], axis=2) - ra[:, None] - rb[None, :]
+        near = gap < cap
+        keep_a, keep_b = ua[near.any(axis=1)], ub[near.any(axis=0)]
+        group_a, group_b = group_a[np.isin(ba, keep_a)], group_b[np.isin(bb, keep_b)]
+        # then each side's geoms against the other side's bounding sphere
+        for _ in range(2):
+            if not len(group_a) or not len(group_b):
+                break
+            pa = data.geom_xpos[group_a]; c = pa.mean(axis=0); r = float((np.linalg.norm(pa - c, axis=1) + model.geom_rbound[group_a]).max())
+            pb = data.geom_xpos[group_b]
+            group_b = group_b[np.linalg.norm(pb - c, axis=1) - model.geom_rbound[group_b] < r + cap]
+            group_a, group_b = group_b, group_a
+        return group_a, group_b
 
     def _min_distance(self, group_a: np.ndarray, group_b: np.ndarray, cap: float = 0.05) -> float:
         data, model = self.data, self.model
+        group_a, group_b = self._near_bodies(group_a, group_b, cap)
+        if not len(group_a) or not len(group_b):
+            return cap
         pa, pb = data.geom_xpos[group_a], data.geom_xpos[group_b]
         ra, rb = model.geom_rbound[group_a], model.geom_rbound[group_b]
         centre = np.linalg.norm(pa[:, None, :] - pb[None, :, :], axis=2)
-        near = centre - ra[:, None] - rb[None, :] < cap
+        bound = centre - ra[:, None] - rb[None, :]   # a lower bound of each pair's distance (bounding spheres)
+        ii, jj = np.nonzero(bound < cap)
         best = cap
-        for i, j in zip(*np.nonzero(near), strict=True):
-            distance = self._mujoco.mj_geomDistance(model, data, int(group_a[i]), int(group_b[j]), cap, self._fromto)
+        # nearest bound first, and stop once no remaining pair can be closer: exact, and few mj_geomDistance calls when
+        # the geoms are many small convex pieces (the r13 collision built from the drawn meshes)
+        for k in np.argsort(bound[ii, jj], kind="stable"):
+            if bound[ii[k], jj[k]] >= best:
+                break
+            distance = self._mujoco.mj_geomDistance(model, data, int(group_a[ii[k]]), int(group_b[jj[k]]), best, self._fromto)
             best = min(best, float(distance))
         return best
+
+    def _active_buckets(self) -> np.ndarray:
+        """The bucket geoms to check: content items' proxies only for the items the bucket fill shows (cached per fill)."""
+        if not self._content_key:
+            return self.buckets
+        model = self.model
+        if self._bucket_keys is None:
+            self._bucket_keys = np.array([self._content_key.get(int(g), -1) for g in self.buckets], dtype=int)
+        keys = self._bucket_keys; k = np.maximum(keys, 0)
+        shown = (keys < 0) | (np.asarray(model.geom_contype)[k] != 0) | (np.asarray(model.geom_conaffinity)[k] != 0)
+        key = shown.tobytes()
+        cached = self._buckets_by_fill.get(key)
+        if cached is None:
+            cached = self._buckets_by_fill[key] = self.buckets[shown]
+        return cached
 
     def measure(self, *, target: str, held: bool) -> dict[str, float]:
         """Return the smallest distance to each kind of obstacle at the private data's current pose.
@@ -1047,14 +1509,17 @@ class _Clearance:
         Returns:
             Distances in metres by :data:`CLEARANCE` key, capped at 5 cm.
         """
-        others = np.concatenate([geoms for name, geoms in self.objects.items() if name != target])
+        others = self._others.get(target)
+        if others is None:   # one array per target, so the near-body cache (keyed by the array) hits
+            others = self._others[target] = np.concatenate([geoms for name, geoms in self.objects.items() if name != target])
+        buckets = self._active_buckets()
         out = {
-            "bucket": self._min_distance(self.robot, self.buckets),
+            "bucket": self._min_distance(self.robot, buckets),
             "objects": self._min_distance(self.robot, others),
             "table": self._min_distance(self.fingers, self.table),
         }
         if held:
-            out["held_bucket"] = self._min_distance(self.objects[target], self.buckets)
+            out["held_bucket"] = self._min_distance(self.objects[target], buckets)
             out["held_objects"] = self._min_distance(self.objects[target], others)
         if self.arm is not None and self.other_arms is not None:
             out["arm"] = self._min_distance(self.arm, self.other_arms)
@@ -1176,6 +1641,482 @@ class SceneSnapshot:
         return cls(np.array(data.qpos), np.array(data.mocap_pos), np.array(data.mocap_quat))
 
 
+SOLVE_CACHE_MAX = 200_000
+"""Most remembered IK solves within one attempt plan (:meth:`FrankaIK.solve_cache`)."""
+
+
+def brisk_for_several(params: DemoParams, rng: np.random.Generator | None) -> DemoParams:
+    """The timing of an episode that sorts several objects (r11, D4: the hang limit is 3 x the median episode, and
+    each object costs about one single-object episode): every speed and pause at the brisk end of its range of
+    :meth:`DemoParams.sample`. With *rng* (the randomised mixes), drawn from the brisk quarter of each range; without
+    (the default, unrandomised speeds), the brisk end itself."""
+    brisk = {"transit_speed": (0.30, 0.55, +1), "fine_speed": (0.08, 0.16, +1), "lift_speed": (0.12, 0.24, +1),
+             "close_s": (0.45, 0.8, -1), "release_pause_s": (0.0, 0.4, -1), "after_release_s": (0.25, 0.6, -1), "start_pause_s": (0.4, 1.2, -1)}
+    values = {}
+    for name, (lo, hi, sign) in brisk.items():
+        quarter = (hi - lo) / 4
+        end = hi if sign > 0 else lo
+        values[name] = float(end - sign * (rng.uniform(0.0, quarter) if rng is not None else 0.0))
+    return replace(params, **values)
+
+
+OPERATOR_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
+OPERATOR_CLOSING_MM_S = (9.4, 15.0, 23.5, 38.2, 87.7)
+"""r15 (D7): the real operator's hand speed (mm/s, the point between the finger tips by the arm's kinematics) while the
+real gripper closes, quantiles p10-p90 of the reviewer's allowed export, TRAIN episodes 0, 2, 6, 7, 9 (143 frames;
+scripts/real2sim/v2, sim/r15/real_drift_stats.json). The real hand almost never stands still while the gripper moves."""
+OPERATOR_OPENING_MM_S = (9.7, 16.1, 45.2, 108.8, 178.1)
+"""The same while the real gripper opens (131 frames); about half of it rising."""
+OPERATOR_START_STILL_Q = ((0.0, 0.25, 0.5, 0.75, 1.0), (0.0, 0.27, 0.63, 0.73, 0.80))
+"""The real arm's stillness from a recording's first frame to its first motion (0.1 deg per frame), TRAIN episodes 0, 2,
+6, 7, 9 sorted, as a quantile curve (probability, seconds). DEV 1, 3, 10: 0.50 / 0.73 / 0.90 s."""
+START_OVERHEAD_S = 0.20
+"""What a recording adds to the start pause before the first motion: Studio's start after the go and the plan's ramp to
+0.1 deg per frame (r16 check 3, 20 episodes: 0.17-0.26 s, median 0.20)."""
+
+
+def start_pause(u: float) -> float:
+    """r16: the start pause for a uniform draw *u*: the TRAIN curve less :data:`START_OVERHEAD_S` (at least 0), so that
+    the recorded start stillness follows the real one (p10 / median / p90 about 0.20 / 0.63 / 0.78 s against TRAIN 0.14 /
+    0.67 / 0.81; the overhead floors the shortest). Chosen on DEV over U(0, 0.62) s (0.26 / 0.51 / 0.76)."""
+    return max(0.0, float(np.interp(u, *OPERATOR_START_STILL_Q)) - START_OVERHEAD_S)
+
+
+CLOSE_DRIFT_MAX_MPS = 0.04
+"""The rise while the fingers squeeze is capped at the TRAIN p75 (a faster one would lift before the grip forms)."""
+RELEASE_CREEP_MAX_M = 0.01
+"""The sink before the release goes at most 1 cm (a third of :attr:`BucketSortDemonstrator.RELEASE_GAP`)."""
+RELEASE_RISE_MAX_MPS = 0.11
+"""The rise after the release is capped at the TRAIN p75."""
+CONTACT_MARGIN_S = 0.1
+CLOSE_EARLY_MAX = 0.5
+"""How much of the descent the fingers' closing may overlap at most (its share of the descent; r15-r17 0.5); the fingers
+still reach the object's width only CONTACT_MARGIN_S after the descent ends."""
+"""How long a plan's last target stands before the arm counts as arrived (with the joints within 0.02 rad of it)."""
+"""The rise starts this long after the commanded opening reaches the object's width (the fingers lag the command)."""
+RELEASE_CLEAR_M = 0.01
+"""The rise after the release starts once the commanded opening is this much wider than the object's widest section."""
+RELEASE_RISE_MAX_M = 0.03
+"""The rise after the release goes at most 3 cm (the return starts from there; higher, a pose near the top of the
+workspace can fall out of reach)."""
+
+
+def operator_drift(params: DemoParams, rng: np.random.Generator, scale: float = 1.0) -> DemoParams:
+    """r15 (D7, the coordinator's plan: real drift and pause statistics, TRAIN fit, DEV choice): the hand keeps moving
+    where the scripted demonstrator stood still with the gripper moving, at speeds drawn from the real operator's
+    (:data:`OPERATOR_CLOSING_MM_S`, :data:`OPERATOR_OPENING_MM_S`, the p10-p90 range, times *scale*), and the start pause
+    drawn from the real one (:func:`start_pause`). The motion is commanded arm motion (the plan's checks see
+    it); the directions are the safe ones (up after the grip forms, up once the fingers clear the object), not the real
+    operator's mostly sideways jitter, which would nudge the object before contact.
+
+    Returns:
+        The parameters with the drift.
+    """
+    q = OPERATOR_QUANTILES
+    closing = float(np.interp(rng.uniform(q[0], q[-1]), q, OPERATOR_CLOSING_MM_S)) / 1000.0 * scale
+    creep = float(np.interp(rng.uniform(q[0], q[-1]), q, OPERATOR_CLOSING_MM_S)) / 1000.0 * scale
+    opening = float(np.interp(rng.uniform(q[0], q[-1]), q, OPERATOR_OPENING_MM_S)) / 1000.0 * scale
+    # (r15: no sink before the release: below the release height the plan's rim clearance was set for, the housing met a
+    # bucket wall (record mix 7401); the draw stays, so the other draws keep their values)
+    del creep
+    return replace(params, start_pause_s=start_pause(float(rng.uniform(0.0, 1.0))), close_drift_mps=min(closing, CLOSE_DRIFT_MAX_MPS),
+                   release_rise_mps=min(opening, RELEASE_RISE_MAX_MPS))
+
+
+OPERATOR_TIMING_R18 = {"motion_ramp": None, "release_open_mps": 0.118, "arrive_wait_s": 0.0, "speed_factor": 1.6,
+                       "settle_s": (0.0, 0.15), "after_release_s": (0.0, 0.15)}
+"""r18 (D7, the coordinator's retiming: fitted on TRAIN 0, 2, 6, 7, 9 allowed states, chosen on DEV 1, 3, 10 by the
+still-run histogram and speed-bin distance, gated live in Studio; scripts/real2sim/v2/timing_profile.py, sim/r18/timing):
+the release opening at the operator's 0.118 m/s of width (117-119 mm/s on every single-stage TRAIN open); no fixed wait at
+a plan's end (arrival stays a state: within 0.02 rad); the hold after the close and after the release 0-0.15 s (the
+operator's: 0); the transit, fine and lift speeds x1.6. Joint speeds and accelerations stay under the TRAIN and DEV
+operator's maximum per joint (sim/r18/timing/speed_gate.json). A retry or plan variant drawn later keeps it (_timed_like).
+Tried, not adopted: the ramped move profile (motion_ramp 0.25, free-space moves; move_progress): the best offline profile
+(DEV 18.1 against 23.7) but twice the transits over the joint acceleration bound, each one planned afresh live: stalls of
+4-10 s in Studio (sim/r18/studio_gate). The profile stays available (motion_ramp), off."""
+
+
+def operator_timing(params: DemoParams, rng: np.random.Generator, timing: dict = OPERATOR_TIMING_R18) -> DemoParams:
+    """r18 (D7): the real operator's timing (:data:`OPERATOR_TIMING_R18`), after every other draw, from its own stream.
+
+    Returns:
+        The parameters with the timing.
+    """
+    f = float(timing["speed_factor"])
+    ff, fl = float(timing.get("fine_factor", f)), float(timing.get("lift_factor", f))
+    return replace(params, settle_s=float(rng.uniform(*timing["settle_s"])), after_release_s=float(rng.uniform(*timing["after_release_s"])),
+                   transit_speed=params.transit_speed * f, fine_speed=params.fine_speed * ff, lift_speed=params.lift_speed * fl,
+                   motion_ramp=timing["motion_ramp"], release_open_mps=timing["release_open_mps"], arrive_wait_s=timing["arrive_wait_s"])
+
+
+def _timed_like(new: DemoParams, old: DemoParams, rng: np.random.Generator) -> DemoParams:
+    """r18: a new draw (a retry, a plan variant) keeps the episode's timing: :func:`operator_timing` when *old* has it."""
+    return operator_timing(new, rng) if old.motion_ramp is not None else new
+
+
+def _drift_of(params: DemoParams) -> dict:
+    return {k: getattr(params, k) for k in ("close_drift_mps", "release_creep_mps", "release_rise_mps")}
+
+
+def inverse_min_jerk(y: float, ramp: float | None = None) -> float:
+    """The progress s in [0, 1] at which :func:`move_progress` (with *ramp*) reaches *y* (clipped to [0, 1])."""
+    y = float(np.clip(y, 0.0, 1.0)); lo, hi = 0.0, 1.0
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        if float(move_progress(mid, ramp)) < y:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+# r16 (coordinator, the batch-vs-alone residual): the demonstrator's time thresholds count whole physics steps since
+# the episode's start instead of differences of the ever-growing sim time (Demonstrator._now)
+TICK_CLOCK = True
+AHEAD_BEST_EFFORT = True
+"""r17: a best-effort plan made ahead may be used (:meth:`BucketSortDemonstrator._take_ahead`)."""
+AHEAD_QUALITY_M = 0.0005
+AHEAD_QUALITY_DEG = 0.5
+"""r17 (coordinator): a best-effort plan made ahead is used when, on the actual scene, the target lies within 0.5 mm and
+0.5 deg of where it was planned for (its IK aims there) and no clearance of the exact re-check is more than 0.5 mm worse
+than at planning time; otherwise the attempt is planned afresh."""
+AHEAD_MOVED_M = 0.002
+"""r16 (plan ahead): a plan made ahead is used only if its target moved at most this since it was predicted (the other
+objects are covered by the exact clearance re-check on the actual scene)."""
+AHEAD_TURNED_DEG = 2.0
+
+OBJECT_CUT_M = 0.006
+"""A best-effort plan that brings the hand or the held object this far into another object is not run (r11: a 14 mm
+cut squeezed a CPU into the battery being grasped, 4.1 mm penetration); the attempt fails or retries instead."""
+
+
+def _cuts_objects(plan: JointPlan) -> bool:
+    """Whether *plan* failed its checks and cuts into another object by more than :data:`OBJECT_CUT_M`."""
+    if plan is None or plan.ok:
+        return False
+    worst = min(plan.clearance.get("objects", np.inf), plan.clearance.get("held_objects", np.inf))
+    return bool(worst < -OBJECT_CUT_M)
+
+
+SCREEN_FIRST = True
+"""r16: plan attempts screened first, then (only when none passes) in full again from the same random state
+(:func:`_plan_attempt_core`). Exact because the planner's checks are deterministic; tests that feed the planner
+non-deterministic stand-in plans turn it off."""
+BUCKET_HIT_M = CAMERA_BODY_PLAN_MARGIN
+"""r16: a failed plan whose bucket clearance is below minus this counts as bringing the hand into a bucket
+(:func:`_hits_bucket`). The clearance is measured on the planning proxies, not the collision: the part that meets a rim
+is the camera body, whose proxy is :data:`~physicalai_mujoco_plugin.robot_cameras.CAMERA_BODY_PLAN_MARGIN` (5 mm) larger
+every way than its collision box (the bucket's proxies reach up to 5 mm more), so a plan clearance between 0 and -5 mm
+does not touch. Measured (real2sim v2 r16): planned -5.2 / -8.1 mm, real contact 0.19 / 0.08 mm deep."""
+
+
+def _hits_bucket(plan: JointPlan) -> bool:
+    """r16 (housing contacts at the true 120 mm bucket height): whether *plan* failed its checks and brings the hand (its
+    housing, the camera body) into a bucket (bucket clearance below 0). With other targets left, another goes first and
+    this one waits; otherwise the attempt is refused instead of run as a best effort (a re-ordering, no margin change)."""
+    if plan is None or plan.ok:
+        return False
+    return bool(plan.clearance.get("bucket", np.inf) < -BUCKET_HIT_M)
+
+
+def _may_run_plan(plan: JointPlan) -> bool:
+    """:meth:`BucketSortDemonstrator._may_run` as a function (the planning worker has no demonstrator)."""
+    return not plan.unreached and plan.pos_error <= OUT_OF_REACH and plan.clearance.get("arm", np.inf) >= CLEARANCE["arm"]
+
+
+def _plan_attempt_core(
+    planner: Planner,
+    arm: FrankaArm,
+    gated: bool,  # noqa: FBT001
+    snapshot: SceneSnapshot,
+    q: np.ndarray,
+    start: np.ndarray,
+    instruction: Instruction,
+    params: DemoParams,
+    dt: float,
+    rng: np.random.Generator | None,
+) -> JointPlan:
+    """The body of :meth:`BucketSortDemonstrator.plan_attempt` (see there), for *planner* and *arm*; *gated* as
+    :attr:`BucketSortDemonstrator._gated`. Runs in the demonstrator's process or in its planning worker."""
+    if not SCREEN_FIRST:
+        planner.ik.solve_cache(True)
+        try:
+            return _plan_attempt_cascade(planner, arm, gated, snapshot, q, start, instruction, params, dt, rng)
+        finally:
+            planner.ik.solve_cache(False)
+    planner.ik.solve_cache(True)
+    state = rng.bit_generator.state if rng is not None else None
+    try:
+        # r16 (planning stalls): screen first. A candidate that already fails (joints, IK) skips its clearance sweep, and
+        # a sweep stops at the first tick past a clearance budget. A passing candidate is never cut short, so the plan
+        # returned is the one the full cascade returns (it returns the first passing candidate). Only when none passes
+        # does the cascade run again in full, from the same random state, to rank the failures by their true depths.
+        planner.screening = True
+        planner._screen_record = record = {}
+        plan = _plan_attempt_cascade(planner, arm, gated, snapshot, q, start, instruction, params, dt, rng)
+        if plan.ok:
+            return plan
+        planner.screening = False
+        planner._screen_record = None
+        planner._screen_reuse = record
+        if rng is not None:
+            rng.bit_generator.state = state
+        return _plan_attempt_cascade(planner, arm, gated, snapshot, q, start, instruction, params, dt, rng)
+    finally:
+        planner.screening = False
+        planner._screen_record = None
+        planner._screen_reuse = None
+        planner.ik.solve_cache(False)
+
+
+def _plan_attempt_cascade(
+    planner: Planner,
+    arm: FrankaArm,
+    gated: bool,  # noqa: FBT001
+    snapshot: SceneSnapshot,
+    q: np.ndarray,
+    start: np.ndarray,
+    instruction: Instruction,
+    params: DemoParams,
+    dt: float,
+    rng: np.random.Generator | None,
+) -> JointPlan:
+    planner.load(snapshot)
+    position, rotation = planner.object_pose(instruction.object)
+    axis = planner.grasp_axis_yaw(instruction.object, rotation) + params.yaw_noise
+    # a symmetric object (a cube, a hexagon, a round piece) is grasped across the same width at more yaws: the
+    # wrist's 90 deg either way then reaches more of them
+    candidates = planner.yaw_candidates(
+        axis, float(start[3]), position[:2], period=planner.grasp_period(instruction.object, rotation)
+    )
+    if len(candidates) == 2:  # noqa: PLR2004
+        margins = [planner.key_margin(q, instruction, params, yaw) for yaw in candidates]
+        if abs(margins[0] - margins[1]) < np.radians(10.0):
+            candidates = candidates if params.yaw_choice < 0.5 else candidates[::-1]  # noqa: PLR2004
+        elif margins[1] > margins[0]:
+            candidates = candidates[::-1]
+    safer, safest = arm.heights.safe
+    variants = [
+        params,
+        replace(params, release_z=max(params.release_z, safer[0]), carry_z=max(params.carry_z, safer[1])),
+        replace(
+            params, release_z=safest[0], carry_z=safest[1], blend=0.0, place_offset=(0.0, -0.01), grasp_offset=0.0
+        ),
+    ]
+    if rng is not None:
+        variants += [_timed_like(replace(DemoParams.sample(rng, arm.heights), go_home=params.go_home, **_drift_of(params)), params, rng)
+                     for _ in range(2)]
+    # r18 (5(a), exact parallel planning): every candidate starts from the same planner state (_planner_canon: the IK
+    # data and the planner's per-script fields as they are here), so its plan does not depend on which candidates ran
+    # before it; the candidates of a stage may then run on several workers (PLAN_PARALLEL) and are reduced in their list
+    # order: the first that passes, else the least severe (ties: the earlier; where gated, one that may run first)
+    canon = _planner_canon(planner)
+    best: JointPlan | None = None
+    eligible: JointPlan | None = None
+    """Where :attr:`_gated`, the best plan that may run at all (:meth:`_may_run`)."""
+    try:
+        main = [(variant, float(yaw), ("main", variant, float(yaw))) for variant in variants for yaw in candidates]
+        for plan in _evaluate_candidates(planner, canon, snapshot, start, instruction, q, dt, main):
+            if plan.ok:
+                return plan
+            if best is None or _less_severe(plan, best):
+                best = plan
+            if gated and _may_run_plan(plan) and (eligible is None or _less_severe(plan, eligible)):
+                eligible = plan
+        # None passed. Before running a best effort (which may push a neighbour or miss), try the grasp yaws not yet
+        # tried: a symmetric object (a cube, a cross) offers an axis every quarter turn, and another axis may clear
+        # the objects around it; and a narrower pre-grasp opening, whose fingers come down closer to the object.
+        tried = {round(float(y), 4) for y in candidates}
+        extra = [y for y in planner.all_yaws(axis, float(start[3]), position[:2], period=planner.grasp_period(instruction.object, rotation))
+                 if round(float(y), 4) not in tried]
+        narrow = replace(params, open_margin=min(params.open_margin, 0.012))
+        more = [(variant, float(yaw), ("more", variant, float(yaw))) for variant, yaws in ((params, extra), (narrow, list(candidates) + extra)) for yaw in yaws]
+        for plan in _evaluate_candidates(planner, canon, snapshot, start, instruction, q, dt, more):
+            if plan.ok:
+                return plan
+            if best is None or _less_severe(plan, best):
+                best = plan
+            if gated and _may_run_plan(plan) and (eligible is None or _less_severe(plan, eligible)):
+                eligible = plan
+        if eligible is not None:
+            best = eligible  # a plan that would be refused must not hide one that may run
+        return best  # type: ignore[return-value]
+    finally:
+        _planner_restore(planner, canon)
+
+
+SEVERITY_TIE = 1e-9
+"""r18 (5(a)): severities this close are a tie (the earlier candidate wins). Floating point is not bit-identical across
+processes (numpy's vector reductions depend on memory alignment), and a 1e-14 difference must not pick another plan."""
+
+
+def _less_severe(plan: JointPlan, other: JointPlan) -> bool:
+    return _severity(plan) < _severity(other) - SEVERITY_TIE
+
+
+PLAN_PARALLEL = int(__import__("os").environ.get("PHYSICALAI_PLAN_PARALLEL", "0"))
+_POOLS: dict = {}
+
+
+def _candidate_worker_main(conn: object, model: object, arm: object, others: tuple, flag: object) -> None:
+    """A candidate pool worker: its own planner on its own copy of the model; one candidate per request (r18)."""
+    import os  # noqa: PLC0415
+
+    parent = os.getppid()
+    planner = Planner(model, arm, others)
+    _planning.job = _WorkerJob(flag)
+    while True:
+        try:
+            while not conn.poll(1.0):
+                if os.getppid() != parent:
+                    return
+            msg = conn.recv()
+        except (EOFError, OSError):
+            return
+        if msg is None:
+            return
+        idx, snapshot, canon, start, instruction, q, dt, variant, yaw, key, screening, bits = msg
+        try:
+            model.geom_contype[:], model.geom_conaffinity[:], model.geom_group[:] = bits
+            planner.screening, planner._screen_record, planner._screen_reuse = screening, None, None
+            planner.ik.solve_cache(True)
+            try:
+                reply = (idx, "ok", _evaluate_candidate(planner, canon, snapshot, start, instruction, q, dt, variant, yaw, key))
+            finally:
+                planner.ik.solve_cache(False)
+        except PlanCancelledError:
+            reply = (idx, "cancelled", None)
+        except Exception as exc:  # noqa: BLE001 - the caller evaluates it itself then
+            reply = (idx, "error", repr(exc))
+        try:
+            conn.send(reply)
+        except (BrokenPipeError, OSError):
+            return
+
+
+class _CandidatePool:
+    """PLAN_PARALLEL worker processes evaluating a cascade stage's candidates (r18, 5(a)); results in list order."""
+
+    def __init__(self, model: object, arm: object, others: tuple, n: int) -> None:
+        import multiprocessing as mp  # noqa: PLC0415
+
+        ctx = mp.get_context("spawn")
+        self._flag = ctx.Value("b", 0); self._conns, self._procs = [], []; self._gen = 0; self._lock = threading.Lock()
+        for k in range(n):
+            a, child = ctx.Pipe()
+            proc = ctx.Process(target=_candidate_worker_main, args=(child, model, arm, others, self._flag), name=f"bucket-sort-candidates-{k}", daemon=True)
+            proc.start(); child.close(); self._conns.append(a); self._procs.append(proc)
+
+    def evaluate(self, planner: Planner, canon: dict, snapshot: SceneSnapshot, start: np.ndarray, instruction: Instruction,
+                 q: np.ndarray, dt: float, cands: list) -> list | None:
+        """Every candidate's plan, in list order; ``None`` when a worker fails or another planning thread has the pool
+        (the caller evaluates them itself: the same plans)."""
+        if not all(p.is_alive() for p in self._procs) or not self._lock.acquire(blocking=False):
+            return None
+        try:
+            return self._evaluate(planner, canon, snapshot, start, instruction, q, dt, cands)
+        finally:
+            self._lock.release()
+
+    def _evaluate(self, planner: Planner, canon: dict, snapshot: SceneSnapshot, start: np.ndarray, instruction: Instruction,
+                  q: np.ndarray, dt: float, cands: list) -> list | None:
+        m = planner.model
+        bits = (np.array(m.geom_contype), np.array(m.geom_conaffinity), np.array(m.geom_group))
+        screening = bool(getattr(planner, "screening", False))
+        self._gen += 1; gen = self._gen; self._flag.value = 0   # replies of an earlier, cancelled stage are ignored
+        msg = lambda i: ((gen, i), snapshot, canon, start, instruction, q, dt, cands[i][0], cands[i][1], cands[i][2], screening, bits)  # noqa: E731
+        # one candidate in flight per worker: a large message must not wait on a pipe its worker does not read
+        pending = list(range(len(cands))); busy: dict[int, int] = {}
+        out: dict[int, object] = {}; failed = False
+        try:
+            for w, c in enumerate(self._conns):
+                if pending:
+                    k = pending.pop(0); c.send(msg(k)); busy[w] = k
+            while len(out) < len(cands):
+                for w, c in enumerate(self._conns):
+                    while c.poll(0.0):
+                        (g, idx), status, plan = c.recv()
+                        if g != gen:
+                            continue
+                        out[idx] = plan; busy.pop(w, None)
+                        if status == "cancelled":
+                            raise PlanCancelledError
+                        if status != "ok":
+                            failed = True
+                        if pending:
+                            k = pending.pop(0); c.send(msg(k)); busy[w] = k
+                _checkpoint()
+                if len(out) < len(cands):
+                    self._conns[0].poll(0.005)
+        except PlanCancelledError:
+            self._flag.value = 1   # the workers stop this stage's candidates; the next stage clears it
+            raise
+        except (BrokenPipeError, OSError):
+            return None
+        return None if failed else [out[i] for i in range(len(cands))]
+
+
+def _candidate_pool(planner: Planner) -> _CandidatePool | None:
+    key = (id(planner.model), getattr(planner.arm, "name", str(planner.arm)))
+    pool = _POOLS.get(key)
+    if pool is None:
+        try:
+            pool = _POOLS[key] = _CandidatePool(planner.model, planner.arm, getattr(planner, "_others", ()), PLAN_PARALLEL)
+        except Exception as exc:  # noqa: BLE001 - planning goes on one candidate after another
+            logger.warning("Demonstrator: no candidate pool ({}); planning one candidate after another", exc)
+            return None
+    return pool
+"""r18 (5(a)): worker processes that evaluate a cascade stage's candidates in parallel (0: one after another, here)."""
+_CANON_FIELDS = ("_go_home", "_held_below", "_lowered", "_no_lowering", "held_width", "unreached", "_wrist_probe")
+
+
+def _planner_canon(planner: Planner) -> dict:
+    """The planner state a candidate starts from: the IK data's coordinates and the per-script fields (r18)."""
+    return {"qpos": np.array(planner.ik.data.qpos), **{k: getattr(planner, k, None) for k in _CANON_FIELDS},
+            "_has": {k: hasattr(planner, k) for k in _CANON_FIELDS}}
+
+
+def _planner_restore(planner: Planner, canon: dict) -> None:
+    planner.ik.data.qpos[:] = canon["qpos"]
+    for k in _CANON_FIELDS:
+        if canon["_has"][k]:
+            setattr(planner, k, canon[k])
+        elif hasattr(planner, k):
+            delattr(planner, k)
+    planner._mujoco.mj_kinematics(planner.model, planner.ik.data)
+
+
+def _evaluate_candidate(planner: Planner, canon: dict, snapshot: SceneSnapshot, start: np.ndarray, instruction: Instruction,
+                        q: np.ndarray, dt: float, variant: DemoParams, yaw: float, key: tuple) -> JointPlan:
+    """One attempt candidate from the canonical state (r18)."""
+    planner.load(snapshot)
+    _planner_restore(planner, canon)
+
+    def build(slow: dict[str, float]) -> tuple[MotionScript, float]:
+        return planner.attempt_script(start, instruction, variant, grasp_yaw=yaw, slow=slow)
+
+    plan = planner.checked(build, q, dt, kind="attempt", target=instruction.object, bucket=instruction.bucket, key=key)
+    plan.yaw_grasp = yaw
+    return plan
+
+
+def _evaluate_candidates(planner: Planner, canon: dict, snapshot: SceneSnapshot, start: np.ndarray, instruction: Instruction,
+                         q: np.ndarray, dt: float, cands: list) -> Iterator[JointPlan]:
+    """The candidates' plans in list order: one after another (stopping after one that passes), or all on the
+    candidate pool's workers when PLAN_PARALLEL is set (the same plans: each starts from *canon*)."""
+    pool = _candidate_pool(planner) if PLAN_PARALLEL > 0 and len(cands) > 1 else None
+    if pool is not None:
+        plans = pool.evaluate(planner, canon, snapshot, start, instruction, q, dt, cands)
+        if plans is not None:
+            yield from plans
+            return
+    for variant, yaw, key in cands:
+        plan = _evaluate_candidate(planner, canon, snapshot, start, instruction, q, dt, variant, yaw, key)
+        yield plan
+        if plan.ok:
+            return
+
+
 class Planner:
     """Build and check joint plans of one arm for the bucket_sort scene."""
 
@@ -1196,12 +2137,14 @@ class Planner:
         self.dq_max = np.array(arm.dq_max)
         self.ddq_max = np.array(arm.ddq_max)
         self.clearance = _Clearance(model, self.ik.data, arm, others)
+        self._others = tuple(others)   # r18: the candidate pool's planners are made alike
         self._wrist_probe: tuple[tuple[float, float], float, float] | None = None
         """The last point :meth:`predicted_q7` solved a tilted arm for: the point, joint 7 and the yaw there."""
-        self.shapes = {name: object_shape(model, name) for name in OBJECTS}
-        self._object_qpos = {name: int(model.jnt_qposadr[model.joint(f"{name}:joint").id]) for name in OBJECTS}
-        self._object_body = {name: int(model.body(name).id) for name in OBJECTS}
-        self._bucket_body = {color: int(model.body(f"bucket_{color}").id) for color in BUCKET_COLORS}
+        objects = scene_objects(model)
+        self.shapes = {name: object_shape(model, name) for name in objects}
+        self._object_qpos = {name: int(model.jnt_qposadr[model.joint(f"{name}:joint").id]) for name in objects}
+        self._object_body = {name: int(model.body(name).id) for name in objects}
+        self._bucket_body = {color: int(model.body(f"bucket_{color}").id) for color in bucket_colors(model)}
         self.held_width = 0.04
         """The width the last attempt script grasps; the place re-plan and the clearance use it."""
         self.unreached = False
@@ -1269,6 +2212,15 @@ class Planner:
             axes = shape.grasp_axes(np.eye(3))
         return axes  # type: ignore[return-value]
 
+    def standing(self, name: str, rotation: np.ndarray) -> bool:
+        """Whether elongated object *name* stands on its end (its long side within ~30 deg of the vertical)."""
+        shape = self.shapes[name]
+        return abs(float(rotation[2, shape.long_axis])) >= 0.85  # noqa: PLR2004
+
+    def grasp_period(self, name: str, rotation: np.ndarray) -> float:
+        """The symmetry of the closing yaw: a standing object is round about the vertical (tried every 30 deg)."""
+        return float(np.pi / 6) if self.standing(name, rotation) else grasp_period(name)
+
     def grasp_axis_yaw(self, name: str, rotation: np.ndarray) -> float:
         """Return the world yaw of the closing axis across the object (one of two, pi apart).
 
@@ -1277,6 +2229,14 @@ class Planner:
         """
         closing, _, _ = self.grasp_axes(name, rotation)
         return float(np.arctan2(closing[1], closing[0]))
+
+    def clear_width(self, name: str) -> float:
+        """The widest section across a round body's long side (a dumbbell's caps): what the open fingers must clear
+        on the way down; 0 for other bodies (their box width is the grasp width)."""
+        shape = self.shapes[name]
+        if shape.round_width is None:
+            return 0.0
+        return float(2.0 * max(h for i, h in enumerate(shape.half) if i != shape.long_axis))
 
     def grasp_width(self, name: str, rotation: np.ndarray) -> float:
         """Return the width the hand closes on, at most the hand's opening."""
@@ -1289,9 +2249,15 @@ class Planner:
             The position.
         """
         _, along, _ = self.grasp_axes(name, rotation)
-        # Keep the fingers (2 cm wide) on the object.
-        limit = self.shapes[name].half_length - 0.012
-        point = position + along * float(np.clip(params.grasp_offset, -limit, limit))
+        shape = self.shapes[name]
+        if self.standing(name, rotation) or shape.round_width is not None:
+            # on its end: its middle; a body round about its long side with a waist (the v2 desk's dumbbell resistor):
+            # across its waist, as the real fingers close on its bands
+            point = position.copy()
+        else:
+            # Keep the fingers (2 cm wide) on the object.
+            limit = shape.half_length - 0.012
+            point = position + along * float(np.clip(params.grasp_offset, -limit, limit))
         point[2] = max(float(position[2]), self.arm.min_tcp_z) + params.grasp_dz
         return point
 
@@ -1330,7 +2296,27 @@ class Planner:
         limit_lo, limit_hi = self.ik.lower[w] + 0.1, self.ik.upper[w] - 0.1
         feasible = [y for y in options if limit_lo <= self.predicted_q7(y, xy) <= limit_hi]
         feasible.sort(key=lambda y: abs(y - current))
-        return feasible[:2] if feasible else [base]
+        if feasible:
+            return feasible[:2]
+        # none keeps the 0.1 rad margin: the two that pass the joint's own limits by the most (or miss them by the
+        # least), not the one nearest the current yaw, which may be far outside (a grasp the IK then cannot reach)
+        def overshoot(y: float) -> float:
+            q7 = self.predicted_q7(y, xy)
+            return max(self.ik.lower[w] - q7, q7 - self.ik.upper[w])
+        return sorted(options, key=overshoot)[:2]
+
+    def all_yaws(self, axis_yaw: float, current: float, xy: np.ndarray, *, period: float = np.pi) -> list[float]:
+        """Every closing yaw lining up with *axis_yaw* (one per *period*) whose predicted joint 7 stays inside its
+        hard limits, nearest to *current* first: the wider set :meth:`plan_attempt` falls back on.
+
+        Returns:
+            Yaws, unwrapped near *current*.
+        """
+        base = wrap_near(axis_yaw, current, period)
+        w = self.arm.wrist
+        options = [base + k * period for k in range(-4, 5)]
+        inside = [y for y in options if self.ik.lower[w] <= self.predicted_q7(y, xy) <= self.ik.upper[w]]
+        return sorted(inside, key=lambda y: abs(y - current))
 
     def key_margin(self, q: np.ndarray, instruction: Instruction, params: DemoParams, yaw: float) -> float:
         """Return the joint-limit margin of an attempt's key postures with grasp yaw *yaw* (after :meth:`load`).
@@ -1397,10 +2383,14 @@ class Planner:
         name = instruction.object
         position, rotation = self.object_pose(name)
         grasp = self.grasp_point(name, position, rotation, p)
+        self._held_below = self._below_tcp(name, grasp)
         self.held_width = self.grasp_width(name, rotation)
         script = MotionScript(start, slow)
+        script.ramp = params.motion_ramp
         x0 = start[:3]
-        open_width = min(self.ik.grip_open, self.held_width + p.open_margin)
+        # open to clear the widest section, not the closing width: a dumbbell's caps are wider than its waist (r11, T6:
+        # a narrow opening at the waist width clipped a standing resistor's cap on the way down)
+        open_width = min(self.ik.grip_open, max(self.held_width, self.clear_width(name)) + p.open_margin)
         pre = grasp + np.array([0.0, 0.0, p.pregrasp_height])
         # Get up and clear first when starting low and away from the object (a retry).
         if x0[2] < pre[2] - 0.02 and np.linalg.norm(x0[:2] - grasp[:2]) > 0.03:  # noqa: PLR2004
@@ -1409,7 +2399,7 @@ class Planner:
                 "approach",
                 pos=up,
                 grip=max(start[4], open_width),
-                duration=move_duration(up[2] - x0[2], p.lift_speed, 0.5),
+                duration=move_duration(up[2] - x0[2], p.lift_speed, 0.5, ramp=p.motion_ramp),
                 tilt=self.tilt_at(up, float(script.end[3])),
             )
         here, leaning = script.end[:3], script.end_tilt
@@ -1420,9 +2410,9 @@ class Planner:
             yaw=grasp_yaw,
             grip=open_width,
             duration=max(
-                move_duration(float(np.linalg.norm(pre - here)), p.transit_speed, 0.8),
-                move_duration(grasp_yaw - script.end[3], p.yaw_speed, 0.8),
-                move_duration((tilt or 0.0) - script.end_tilt, p.yaw_speed, 0.8),
+                move_duration(float(np.linalg.norm(pre - here)), p.transit_speed, 0.8, ramp=p.motion_ramp),
+                move_duration(grasp_yaw - script.end[3], p.yaw_speed, 0.8, ramp=p.motion_ramp),
+                move_duration((tilt or 0.0) - script.end_tilt, p.yaw_speed, 0.8, ramp=p.motion_ramp),
             ),
             blend=p.blend,
             tilt=tilt,
@@ -1432,18 +2422,35 @@ class Planner:
         script.add(
             "descend",
             pos=grasp,
-            duration=move_duration(p.pregrasp_height, p.fine_speed, 0.6),
+            duration=move_duration(p.pregrasp_height, p.fine_speed, 0.6),   # a MIN_JERK_PHASES move
             blend=0.0 if tilt is not None and abs(tilt - leaning) > 1e-9 else p.blend,  # noqa: PLR2004
             tilt=self.tilt_at(grasp, grasp_yaw, grasp=True),
         )
         squeeze = self.arm.squeeze
-        script.add("close", grip=0.0 if squeeze is None else max(0.0, self.held_width - squeeze), duration=p.close_s)
-        script.pause("close", p.settle_s)
+        width_from = float(script.end[4]); width_to = 0.0 if squeeze is None else max(0.0, self.held_width - squeeze)
+        touch = inverse_min_jerk((width_from - self.held_width) / max(width_from - width_to, 1e-9)) * p.close_s   # the fingers: min jerk
+        early = 0.0
+        # r15: not for a round body (a resistor rolls into the grip while the fingers squeeze it; rising then left it held
+        # off-centre and it fell outside the bucket, default seed 5783)
+        close_drift = p.close_drift_mps if self.clear_width(name) <= 0.0 else 0.0
+        if close_drift > 0.0 and script.moves:
+            # r15 (operator drift): the fingers start closing while the descent ends; the descent is over CONTACT_MARGIN_S
+            # before the fingers reach the object's width, so the hand never moves sideways or down against it
+            early = min(max(0.0, touch - CONTACT_MARGIN_S), CLOSE_EARLY_MAX * script.moves[-1].duration)
+        script.add("close", grip=width_to, duration=p.close_s, blend=early / script.moves[-1].duration if early > 0.0 else 0.0)
+        if close_drift > 0.0:
+            # r15 (operator drift): rising through the settle. r16: only once the close has ended (rising during the
+            # squeeze shifted flat objects in the grip too: default 5703 and 5747, a battery dropped outside)
+            rise_s = p.settle_s
+            rise = min(close_drift * rise_s, 0.5 * p.lift_height)
+            script.add("close", pos=grasp + np.array([0.0, 0.0, rise]), duration=rise_s)
+        else:
+            script.pause("close", p.settle_s)
         lift = grasp + np.array([0.0, 0.0, p.lift_height])
         script.add(
             "lift",
             pos=lift,
-            duration=move_duration(p.lift_height, p.lift_speed, 0.6, p.held_accel),
+            duration=move_duration(p.lift_height, p.lift_speed, 0.6, p.held_accel, ramp=p.motion_ramp),
             tilt=self.tilt_at(lift, grasp_yaw),
         )
 
@@ -1472,13 +2479,14 @@ class Planner:
             The script and the release yaw.
         """
         script = MotionScript(start, slow)
+        script.ramp = params.motion_ramp
         if start[2] < params.carry_z - REPLAN_SHIFT:  # re-planned on the way down into the bucket: rise first
             rise = params.carry_z - float(start[2])
             up = np.array([start[0], start[1], params.carry_z])
             script.add(
                 "carry",
                 pos=up,
-                duration=move_duration(rise, params.lift_speed, 0.5),
+                duration=move_duration(rise, params.lift_speed, 0.5, ramp=params.motion_ramp),
                 tilt=self.tilt_at(up, float(start[3])),
             )
         yaw_release = self._add_place(script, instruction, params, float(start[3]), np.asarray(offset)[:2])
@@ -1512,38 +2520,114 @@ class Planner:
             pos=over,
             yaw=yaw_release,
             duration=max(
-                move_duration(float(np.linalg.norm(over - script.end[:3])), p.transit_speed, 0.8, p.held_accel),
-                move_duration(turn, p.yaw_speed, 0.8),
-                move_duration((tilt or 0.0) - script.end_tilt, p.yaw_speed, 0.8),
+                move_duration(float(np.linalg.norm(over - script.end[:3])), p.transit_speed, 0.8, p.held_accel, ramp=p.motion_ramp),
+                move_duration(turn, p.yaw_speed, 0.8, ramp=p.motion_ramp),
+                move_duration((tilt or 0.0) - script.end_tilt, p.yaw_speed, 0.8, ramp=p.motion_ramp),
             ),
             blend=p.blend,
             tilt=tilt,
         )
-        release = np.array([over[0], over[1], p.release_z])
+        release_z = self.release_height(place, p)
+        release = np.array([over[0], over[1], release_z])
         script.add(
             "lower",
             pos=release,
-            duration=move_duration(p.carry_z - p.release_z, p.fine_speed, 0.5, p.held_accel),
+            # (at the lift speed: the release now goes up to 9 cm deeper into the bucket, the fine speed made it slow)
+            duration=move_duration(p.carry_z - release_z, max(p.fine_speed, p.lift_speed), 0.5, p.held_accel),   # MIN_JERK_PHASES
             blend=p.blend,
             tilt=self.tilt_at(release, yaw_release),
         )
-        script.pause("release", p.release_pause_s)
-        script.add("release", grip=min(self.ik.grip_open, self.held_width + p.release_margin), duration=0.45)
-        script.pause("release", p.after_release_s)
+        if p.release_creep_mps > 0.0 and p.release_pause_s > 0.0:
+            # r15 (operator drift): the hand keeps sinking a little before it opens, and rises once the fingers clear
+            creep = min(p.release_creep_mps * p.release_pause_s, RELEASE_CREEP_MAX_M)
+            script.add("release", pos=release - np.array([0.0, 0.0, creep]), duration=p.release_pause_s)
+        else:
+            script.pause("release", p.release_pause_s)
+        width_from = float(script.end[4]); width_to = min(self.ik.grip_open, self.held_width + p.release_margin)
+        # r18 (D7): the fingers open at the operator's speed (DemoParams.release_open_mps), r1-r17 over a fixed 0.45 s
+        open_s = 0.45 if p.release_open_mps is None else max(0.1, abs(width_to - width_from) / p.release_open_mps)
+        # the rise waits until the fingers clear the object's WIDEST section (a resistor held at its waist has wider caps)
+        widest = max(self.held_width, self.clear_width(instruction.object))
+        clear = inverse_min_jerk((widest + RELEASE_CLEAR_M - width_from) / max(width_to - width_from, 1e-9)) * open_s
+        # r15 (operator drift): the fingers start opening while the hand still sinks (the object stays held until they clear it)
+        early = min(max(0.0, clear - CONTACT_MARGIN_S), 0.5 * p.release_pause_s) if p.release_creep_mps > 0.0 and p.release_pause_s > 0.0 else 0.0
+        script.add("release", grip=width_to, duration=open_s, blend=early / p.release_pause_s if early > 0.0 else 0.0)
+        if p.release_rise_mps > 0.0:
+            overlap = max(0.0, open_s - clear)
+            rise_s = overlap + p.after_release_s
+            rise = min(p.release_rise_mps * rise_s, RELEASE_RISE_MAX_M)
+            script.add("release", pos=script.end[:3] + np.array([0.0, 0.0, rise]), duration=max(rise_s, 1e-3), blend=overlap / open_s)
+        else:
+            script.pause("release", p.after_release_s)
         return yaw_release
 
+    RELEASE_GAP, RELEASE_DROP_MAX = 0.03, 0.09
+    """The release (r11, the r09/r10 3.3 mm release penetration: a battery dropped 15 cm onto an empty bucket's floor):
+    the held object's bottom goes to RELEASE_GAP above whatever lies under the release point (the floor or the
+    contents), the TCP at most RELEASE_DROP_MAX (9 cm) below the drawn ``release_z`` (the plan's checks still guard the rims)."""
+
+    def _below_tcp(self, name: str, grasp: np.ndarray) -> float:
+        """How far the object reaches below the TCP once grasped at *grasp* (it lies on the table now)."""
+        import mujoco  # noqa: PLC0415
+        m, d = self.model, self.ik.data
+        body = int(m.body(name).id); low = np.inf
+        for g in np.flatnonzero(np.asarray(m.geom_bodyid) == body):
+            if int(m.geom_contype[g]) == 0 and int(m.geom_conaffinity[g]) == 0:
+                continue
+            low = min(low, float(d.geom_xpos[g][2] - m.geom_rbound[g]) if m.geom_rbound[g] > 0 else float(d.geom_xpos[g][2]))
+        aabb_low = float(d.xpos[body][2] - self.shapes[name].half.min()) if name in self.shapes else low
+        bottom = max(low, aabb_low) if np.isfinite(low) else aabb_low
+        return max(0.0, float(grasp[2]) - bottom)
+
+    def _ray_start_z(self) -> float:
+        """Where the release's downward ray starts: 3 cm above the bucket mesh's top (0.115 m without a bucket mesh)."""
+        if not hasattr(self, "_ray_z"):
+            m = self.model; z = 0.115
+            try:
+                k = int(m.mesh("bucket").id); a, n = int(m.mesh_vertadr[k]), int(m.mesh_vertnum[k])
+                tops = [float(m.geom_pos[g][2]) + float(m.mesh_vert[a:a + n, 2].max()) for g in range(m.ngeom)
+                        if m.geom_type[g] == 7 and int(m.geom_dataid[g]) == k]   # mjGEOM_MESH
+                if tops: z = max(tops) + 0.03
+            except KeyError:
+                pass
+            self._ray_z = z
+        return self._ray_z
+
+    def release_height(self, place: np.ndarray, p: DemoParams) -> float:
+        """The TCP height of the release over *place* (see :attr:`RELEASE_GAP`)."""
+        import mujoco  # noqa: PLC0415
+        below = getattr(self, "_held_below", None)
+        self._lowered = False
+        if below is None or getattr(self, "_no_lowering", False):
+            return p.release_z
+        m, d = self.model, self.ik.data
+        # r17 (D4, 622597): the ray starts above the bucket's own top (the drawn mesh's height in this model), not at a
+        # fixed 0.115 m: with the 120 mm buckets, contents heaped near the rim lay above that start, the release was
+        # lowered onto them and a held resistor was pressed 3.24 mm into a content item
+        start = np.array([place[0], place[1], self._ray_start_z()]); geomid = np.array([-1], dtype=np.int32)
+        groups = np.array([1, 1, 1, 1, 1, 1], dtype=np.uint8)
+        dist = mujoco.mj_ray(m, d, start, np.array([0.0, 0.0, -1.0]), groups, 1, -1, geomid)
+        if dist < 0:
+            return p.release_z
+        surface = float(start[2] - dist)
+        z = float(min(p.release_z, max(surface + below + self.RELEASE_GAP, p.release_z - self.RELEASE_DROP_MAX)))
+        self._lowered = z < p.release_z - 1e-6
+        return z
+
     def add_return(self, script: MotionScript, p: DemoParams) -> None:
-        """Add the retreat straight up; :meth:`solve` adds the joint-space way home after it."""
+        """Add the retreat straight up; :meth:`solve` adds the joint-space way home after it. With ``p.go_home``
+        false (more objects of the instruction to sort), only the retreat straight up: the plan ends there."""
+        self._go_home = bool(getattr(p, "go_home", True))
         here = script.end[:3]
         retreat_z = max(here[2] + 0.06, self.arm.heights.retreat_z)
         up = np.array([here[0], here[1], retreat_z])
         script.add(
             "retreat",
             pos=up,
-            duration=move_duration(retreat_z - here[2], p.lift_speed, 0.5),
+            duration=move_duration(retreat_z - here[2], p.lift_speed, 0.5, ramp=p.motion_ramp),
             tilt=self.tilt_at(up, float(script.end[3])),
         )
-        if self.arm.max_tilt > 0.0:
+        if self.arm.max_tilt > 0.0 and self._go_home:
             # Home is low for a six-joint arm: go there in a straight line, over the buckets'
             # rims, not in joint space, which dips the hand. The joint-space way home is then short.
             ik = self.ik
@@ -1555,9 +2639,9 @@ class Planner:
                 yaw=yaw,
                 tilt=ik.tilt(),
                 duration=max(
-                    move_duration(float(np.linalg.norm(home - up)), p.transit_speed, 0.8),
-                    move_duration(yaw - script.end[3], p.yaw_speed, 0.8),
-                    move_duration(script.end_tilt, p.yaw_speed, 0.8),
+                    move_duration(float(np.linalg.norm(home - up)), p.transit_speed, 0.8, ramp=p.motion_ramp),
+                    move_duration(yaw - script.end[3], p.yaw_speed, 0.8, ramp=p.motion_ramp),
+                    move_duration(script.end_tilt, p.yaw_speed, 0.8, ramp=p.motion_ramp),
                 ),
                 blend=p.blend,
             )
@@ -1572,6 +2656,7 @@ class Planner:
         target: str,
         bucket: str,
         held_from: float | None = None,
+        key: object = None,
     ) -> JointPlan:
         """Build a script, solve it, and stretch the moves that are too fast until the joints keep to the limits.
 
@@ -1587,6 +2672,30 @@ class Planner:
         Returns:
             The last plan solved (``problems`` says whether it passed).
         """
+        # r16: the full pass after a screening pass that found no plan reuses each candidate whose screened sweep ran in
+        # full (its result is the full one), leaving the data as that sweep did; only the cut ones are solved again
+        reuse = getattr(self, "_screen_reuse", None)
+        if key is not None and reuse is not None and key in reuse:
+            plan = reuse[key]
+            if self._as_swept(plan, target, plan.held_ticks):
+                return plan
+        plan = self._checked(build, q, dt, kind=kind, target=target, bucket=bucket, held_from=held_from)
+        record = getattr(self, "_screen_record", None)
+        if key is not None and record is not None and not getattr(plan, "screen_partial", False):
+            record[key] = plan
+        return plan
+
+    def _checked(
+        self,
+        build: Callable[[dict[str, float]], tuple[MotionScript, float]],
+        q: np.ndarray,
+        dt: float,
+        *,
+        kind: PlanKind,
+        target: str,
+        bucket: str,
+        held_from: float | None = None,
+    ) -> JointPlan:
         slow: dict[str, float] = {}
         plan: JointPlan | None = None
         bucket_pos, bucket_rot = self.bucket_pose(bucket)
@@ -1595,7 +2704,8 @@ class Planner:
             script, yaw_release = build(slow)
             start = script.first_time("lift") + 0.1 if held_from is None else held_from
             release = next((m.t0 for m in script.moves if m.phase == "release"), script.t_end)
-            plan = self.solve(script, q, dt, kind=kind, target=target, held_from=start, held_until=release)
+            # r16: the clearance sweep only for the plan kept (a too-fast plan is stretched and solved again)
+            plan = self.solve(script, q, dt, kind=kind, target=target, held_from=start, held_until=release, clearance=False)
             plan.yaw_release = yaw_release
             velocity = np.diff(plan.q, axis=0) / dt
             speed = (np.abs(velocity) / self.dq_max).max(axis=1)
@@ -1614,6 +2724,17 @@ class Planner:
             for phase, factor in factors.items():
                 slow[phase] = min(MAX_STRETCH, slow.get(phase, 1.0) * factor)
         assert plan is not None  # noqa: S101 - the loop runs at least once
+        plan.held_ticks = self._held_ticks(start, release, dt)   # r16: what the sweep used, for an exact re-check later
+        plan.held_width = float(self.held_width)
+        self._check_clearance(plan, target, plan.held_ticks)
+        if getattr(self, "_lowered", False) and not getattr(self, "_no_lowering", False) and any(
+            pr.startswith("bucket clearance") for pr in plan.problems
+        ):   # the deeper release (release_height) reaches a rim: the same plan at the drawn release height instead
+            self._no_lowering = True
+            try:
+                return self._checked(build, q, dt, kind=kind, target=target, bucket=bucket, held_from=held_from)
+            finally:
+                self._no_lowering = False
         plan.bucket_pose = (bucket_pos, float(np.arctan2(bucket_rot[1, 0], bucket_rot[0, 0])))
         self._annotate(plan)
         if self.unreached:
@@ -1652,6 +2773,7 @@ class Planner:
         held_until: float | None = None,
         home_speed: float = 0.3,
         home_blend: float = 0.3,
+        clearance: bool = True,
     ) -> JointPlan:
         """Turn *script* into joint targets every *dt*, then the way home, and check them (after :meth:`load`).
 
@@ -1666,6 +2788,7 @@ class Planner:
             home_speed: After the script, the arm returns home (:attr:`FrankaIK.home`) in joint space, each
                 joint at most this fraction of its speed and acceleration limits.
             home_blend: Fraction of the script's last move that the way home overlaps.
+            clearance: Sweep the clearances too (:meth:`checked` defers it to the plan it keeps).
 
         Returns:
             The plan; ``problems`` lists every check that failed.
@@ -1675,10 +2798,14 @@ class Planner:
         n_script = len(q_script)
         cartesian = script.at(np.arange(n_script) * dt)
         phases = script.phases(np.arange(n_script) * dt)
+        if not getattr(self, "_go_home", True):   # more objects to sort: no way home, the plan ends above the bucket
+            home_speed = 0.0
         # The way home, in joint space: a minimum-jerk move of every joint onto the ready pose,
         # starting while the last move of the script ends.
         delta = self.ik.home - q_script[-1]
-        home_s = max(
+        if home_speed <= 0.0:
+            delta = np.zeros_like(delta)
+        home_s = 1.0 if home_speed <= 0.0 else max(
             1.2,
             1.875 * float(np.max(np.abs(delta) / (home_speed * self.dq_max))),
             float(np.sqrt(5.77 * np.max(np.abs(delta) / (home_speed * self.ddq_max)))),
@@ -1695,6 +2822,8 @@ class Planner:
         all_phases: list[Phase] = [*phases, *([phases[-1]] * extra)]
         returning: list[Phase] = ["return"] * (ticks - home_tick)
         all_phases = [*all_phases[:home_tick], *returning]
+        if home_speed <= 0.0:   # no way home: exactly the script (the retreat's end is at rest)
+            q, cartesian, grip, all_phases = q_script, cartesian[:n_script], cartesian[:n_script, 4].copy(), list(phases)
         plan = JointPlan(
             kind=kind,
             dt=dt,
@@ -1706,11 +2835,30 @@ class Planner:
             rot_error=rot_error,
         )
         self._check_joints(plan)
-        held = None
-        if held_from is not None and held_until is not None:
-            held = (int(np.ceil(held_from / dt)), int(np.floor(held_until / dt)))
-        self._check_clearance(plan, target, held)
+        held = self._held_ticks(held_from, held_until, dt)
+        if clearance or not self._as_swept(plan, target, held):
+            self._check_clearance(plan, target, held)
         return plan
+
+    @staticmethod
+    def _held_ticks(held_from: float | None, held_until: float | None, dt: float) -> tuple[int, int] | None:
+        if held_from is None or held_until is None:
+            return None
+        return (int(np.ceil(held_from / dt)), int(np.floor(held_until / dt)))
+
+    def _as_swept(self, plan: JointPlan, target: str, held: tuple[int, int] | None) -> bool:
+        """Leave the private data as a full clearance sweep of *plan* leaves it (the arm at the last swept tick, the
+        object at rest, the kinematics of that tick), since the next script is built from that data. ``False`` when
+        that tick holds the object (then only the sweep itself reproduces it)."""
+        k = ((len(plan.q) - 1) // CHECK_EVERY) * CHECK_EVERY
+        if held is not None and held[0] <= k < held[1]:
+            return False
+        ik, data = self.ik, self.ik.data
+        adr = self._object_qpos[target]; rest = np.array(data.qpos[adr : adr + 7])
+        ik.set_arm(plan.q[k], float(plan.grip[k]))
+        self._mujoco.mj_kinematics(self.model, data)
+        data.qpos[adr : adr + 7] = rest
+        return True
 
     def _follow_script(  # noqa: PLR0914 - one numerical routine; splitting it hides the algorithm
         self, script: MotionScript, q_start: np.ndarray, dt: float
@@ -1820,6 +2968,17 @@ class Planner:
         rest_qpos = np.array(data.qpos[adr : adr + 7])
         worst: dict[str, float] = dict.fromkeys(CLEARANCE, float(np.inf))
         quat = np.zeros(4)
+        screening = getattr(self, "screening", False)
+        # While a deeper release may still be retried at the drawn height (:meth:`checked` retries when a bucket clearance
+        # problem is found), that problem decides what happens next: the sweep runs until it finds one, whatever else
+        # fails; otherwise it stops at any problem, or is not needed at all when the plan fails already.
+        retry_possible = getattr(self, "_lowered", False) and not getattr(self, "_no_lowering", False)
+        stop_keys = [key for key in CLEARANCE if key.startswith("bucket")] if retry_possible else list(CLEARANCE)
+        if screening and plan.problems and not retry_possible and self._as_swept(plan, target, held):   # r16: it fails already
+            plan.clearance = {}
+            plan.screen_partial = True
+            return
+        stopped = False
         for k in range(0, len(plan.q), CHECK_EVERY):
             _checkpoint()
             holding = held is not None and held[0] <= k < held[1]
@@ -1837,11 +2996,36 @@ class Planner:
             self._mujoco.mj_kinematics(self.model, data)
             for key, value in self.clearance.measure(target=target, held=holding).items():
                 worst[key] = min(worst[key], value)
+            if not holding and plan.phases[k] in ("approach", "descend"):   # r17: the hand against the target before the close
+                worst["target"] = min(worst["target"], self.clearance._min_distance(self.clearance.robot, self.clearance.objects[target]))
+            if screening and any(worst[key] < self._budget(key) for key in stop_keys):
+                stopped = True
+                plan.screen_partial = True
+                break   # r16: a problem for certain; the sweep's remaining ticks cannot make it pass
         data.qpos[adr : adr + 7] = rest_qpos
+        if stopped and not self._as_swept(plan, target, held):   # the last tick holds the object (rare): the full sweep
+            self.screening = False
+            try:
+                self._check_clearance(plan, target, held)
+            finally:
+                self.screening = True
+            return
         plan.clearance = {key: value for key, value in worst.items() if np.isfinite(value)}
+        plan.target_budget = self._budget("target")   # r17: the scene's, for _severity
         plan.problems += [
-            f"{key} clearance {value * 1000:.1f} mm" for key, value in plan.clearance.items() if value < CLEARANCE[key]
+            f"{key} clearance {value * 1000:.1f} mm" for key, value in plan.clearance.items() if value < self._budget(key)
         ]
+
+    def _budget(self, key: str) -> float:
+        """CLEARANCE[key]; the target's from the scene's numeric ``r2s_target_descent_m`` when it has one (r17)."""
+        if key != "target":
+            return CLEARANCE[key]
+        if not hasattr(self, "_target_budget"):
+            try:
+                self._target_budget = float(self.model.numeric("r2s_target_descent_m").data[0])
+            except KeyError:
+                self._target_budget = CLEARANCE["target"]
+        return self._target_budget
 
 
 # ----------------------------------------------------------------------
@@ -1860,7 +3044,8 @@ def _severity(plan: JointPlan) -> float:
         + max(0.0, plan.pos_error - IK_POS_TOL) * 1000.0
         + max(0.0, plan.peak_speed_ratio - SPEED_FRACTION)
         + max(0.0, plan.peak_accel_ratio - ACCEL_FRACTION)
-        + sum(max(0.0, CLEARANCE[key] - value) * 1000.0 for key, value in plan.clearance.items())
+        + sum(max(0.0, (getattr(plan, "target_budget", CLEARANCE[key]) if key == "target" else CLEARANCE[key]) - value) * 1000.0
+              for key, value in plan.clearance.items())
     )
 
 
@@ -1888,6 +3073,13 @@ def smoothstep(s: np.ndarray) -> np.ndarray:
 class DemoStats:
     """Counters over the demonstrator's lifetime."""
 
+    ahead_used: int = 0
+    """r16: next-object attempts started from the plan made ahead (it passed the exact re-check on the actual state)."""
+    ahead_replanned: int = 0
+    """r16: next-object attempts planned afresh (no plan ahead, another target, or the re-check failed)."""
+    ahead_why: dict = field(default_factory=dict)
+    """r16: why each plan made ahead was not used, counted by reason."""
+
     episodes: int = 0
     attempts: int = 0
     successes: int = 0
@@ -1914,6 +3106,8 @@ class _Episode:
     retry_pending: bool = False
     """Back home after a failed attempt, the next one starts once the object rests."""
     reset_requested: bool = False
+    targets_done: int = 0
+    """Objects of a kind-level instruction already sorted in this episode."""
 
 
 class BucketSortDemonstrator:
@@ -1944,6 +3138,7 @@ class BucketSortDemonstrator:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         reset_on_failure: bool = True,
         background_planning: bool = False,
+        plan_process: bool | None = None,
     ) -> None:
         """Bind to the scene model and its task.
 
@@ -1957,6 +3152,8 @@ class BucketSortDemonstrator:
             max_attempts: Attempts per episode, the retry included.
             reset_on_failure: Ask for a scene reset after a failed episode (:meth:`take_reset_request`).
             background_planning: Plan on a thread of its own, so :meth:`step` returns at once.
+            plan_process: Plan attempts in a worker process (:class:`_PlanProcess`); ``None``: with background
+                planning, unless the environment sets ``PHYSICALAI_PLAN_PROCESS=0``.
         """
         from physicalai_mujoco_plugin.profiles.derive import control_kind  # noqa: PLC0415
 
@@ -1970,6 +3167,15 @@ class BucketSortDemonstrator:
         self.max_attempts = int(max_attempts)
         self.reset_on_failure = reset_on_failure
         self._rng = rng if rng is not None else np.random.default_rng()
+        # r16 (plan ahead): the next object's attempt, planned while the current one releases and retreats
+        self._ahead: dict | None = None
+        self._ahead_planner: Planner | None = None
+        self._transited = False   # r16: the move over the current next object is done (or was tried)
+        # r16 (plan before record): with the start gate on, an episode's first attempt waits at "ready" until a go
+        self._start_gate = False
+        self._await_go = False
+        self._go = False
+        self._go_time: float | None = None
         self._actuators = np.array([
             int(model.actuator(arm.name(name)).id) for arm in self.arms for name in (*arm.actuators, arm.gripper)
         ])
@@ -1997,8 +3203,8 @@ class BucketSortDemonstrator:
         """The arm a stuck start moved, which works the episode's first attempt (several arms)."""
         """Since when every arm stands still on its targets (several arms)."""
         """The targets each arm that does not work holds, model units (seven joints and the opening in metres)."""
-        self._object_body = {name: int(model.body(name).id) for name in OBJECTS}
-        self._bucket_body = {color: int(model.body(f"bucket_{color}").id) for color in BUCKET_COLORS}
+        self._object_body = {name: int(model.body(name).id) for name in scene_objects(model)}
+        self._bucket_body = {color: int(model.body(f"bucket_{color}").id) for color in bucket_colors(model)}
         self._q: np.ndarray | None = None
         self._q_prev: np.ndarray | None = None
         self._braking_from = self.ik.home.copy()
@@ -2009,6 +3215,7 @@ class BucketSortDemonstrator:
         self._tick = 0
         self._phase: Phase = "idle"
         self._since = 0.0
+        self._t_anchor = 0.0   # r16: sim time at the episode's start (the tick clock's zero)
         self._plan_end: float | None = None
         self._lag_since: float | None = None
         self._lift_check_since: float | None = None
@@ -2019,8 +3226,16 @@ class BucketSortDemonstrator:
         self.plans: list[JointPlan] = []
         """Every plan of the current episode, for diagnostics."""
         self.background_planning = background_planning
+        import os  # noqa: PLC0415
+
+        env = os.environ.get("PHYSICALAI_PLAN_PROCESS")
+        self._use_plan_process = (background_planning if env is None else env not in ("0", "off", "false")) if plan_process is None else plan_process
+        self._plan_proc: _PlanProcess | None = None
         self._job: _PlanJob | None = None
         """The plan on its own thread, until the control thread collects it (:meth:`_finish`)."""
+        self._housing: tuple | None = None   # (hand housing bodies, objects and buckets): _check_housing
+        self._collateral: dict | None = None   # _check_collateral
+        self._pile_dofs: tuple | None = None; self._pile_still_since: float | None = None   # _pile_still
         self._scratch: object | None = None
         """The planning thread's copy of the data."""
         self._deferring = False
@@ -2099,6 +3314,16 @@ class BucketSortDemonstrator:
         """The plan that ran last."""
         return self.plans[-1] if self.plans else None
 
+    def set_start_gate(self, *, enabled: bool | None = None, go: bool = False) -> None:
+        """r16 (plan before record): ``enabled`` switches the start gate; ``go`` releases the episode waiting at it (a
+        go before the episode is ready counts for it, so a recorder may send it right after it starts recording)."""
+        if enabled is not None:
+            self._start_gate = bool(enabled)
+            if not enabled:
+                self._await_go = False
+        if go:
+            self._go = True
+
     def status(self) -> dict[str, object]:
         """Return the episode status for ``/health``: instruction, attempt, outcome and why it failed.
 
@@ -2115,7 +3340,9 @@ class BucketSortDemonstrator:
             return dict(job.status)
         episode = self._current_episode()
         return {
+            "ready": bool(self._await_go and not self._go),   # r16: planned, waiting at the start gate for a go
             "clean": not episode.reasons if episode is not None else None,
+            "reasons": list(episode.reasons) if episode is not None else [],
             "instruction": episode.instruction.text if episode is not None and episode.instruction else None,
             "episode": episode.serial if episode is not None else None,
             "attempt": episode.attempt if episode is not None else 0,
@@ -2151,12 +3378,27 @@ class BucketSortDemonstrator:
         self._reset_state()
 
     def close(self, timeout_s: float = 2.0) -> None:
-        """Cancel a plan in flight and wait for its thread (the scene is unloaded)."""
+        """Cancel a plan in flight and wait for its thread (the scene is unloaded); stop the planning worker."""
         job = self._job
         if job is not None:
             job.cancelled = True
             job.thread.join(timeout_s)
             self.reap()
+        if self._plan_proc is not None:
+            self._plan_proc.close(); self._plan_proc = None
+
+    def _plan_process_for_call(self) -> _PlanProcess | None:
+        """The planning worker, started on first use; ``None`` when planning in this process."""
+        if not self._use_plan_process:
+            return None
+        if self._plan_proc is None or not self._plan_proc.alive:
+            try:
+                self._plan_proc = _PlanProcess(self.model, self.arms)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Demonstrator: no planning worker ({}); planning in this process", exc)
+                self._use_plan_process = False
+                return None
+        return self._plan_proc
 
     def _reset_state(self) -> None:
         self._q = None
@@ -2193,6 +3435,7 @@ class BucketSortDemonstrator:
                 self._advance(data, dt)
             finally:
                 self._deferring = False
+            self._check_housing(data)
             job = self._job
             # A plan just went to its thread, which has the state now: output where the arm is.
             targets = job.hold[0].copy() if job is not None else self._targets(self._q, self._grip)  # type: ignore[index, arg-type]
@@ -2200,6 +3443,75 @@ class BucketSortDemonstrator:
         if apply:
             self.write_targets(data, targets)
         return targets
+
+    def _check_housing(self, data: object) -> None:
+        """In a scene whose model sets the custom numeric ``r2s_housing_contact_unclean`` (the reBot desk v2), a touch of
+        the hand's housing (its hand bodies other than the fingers) on an object or a bucket makes the episode unclean:
+        that collision reaches up to ~8 mm past the drawing, so a recording must not show it touching (real2sim r13)."""
+        import mujoco  # noqa: PLC0415
+
+        model, episode = self.model, self._episode
+        if episode is None:
+            return
+        if self._housing is None:
+            on = False
+            try:
+                on = bool(model.numeric("r2s_housing_contact_unclean").data[0])
+            except KeyError:
+                pass
+            arm = self.active_arm
+            hand = {int(model.body(arm.name(b)).id) for b in arm.hand_bodies} - {int(model.body(arm.name(b)).id) for b in arm.finger_bodies}
+            targets = {int(model.body(n).id) for n in (*scene_objects(model), *(f"bucket_{c}" for c in bucket_colors(model)))}
+            self._housing = (hand, targets) if on else ((), ())
+        self._check_collateral(data, episode)
+        hand, targets = self._housing
+        if not hand:
+            return
+        for i in range(int(data.ncon)):
+            c = data.contact[i]; b1, b2 = int(model.geom_bodyid[c.geom1]), int(model.geom_bodyid[c.geom2])
+            if (b1 in hand and b2 in targets) or (b2 in hand and b1 in targets):
+                other = b2 if b1 in hand else b1
+                reason = f"the hand's housing touched {mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, other)}"
+                if reason not in episode.reasons:
+                    episode.reasons.append(reason); logger.warning("Demonstrator: {} (the episode is not clean)", reason)
+                return
+
+    COLLATERAL_LIFT_M = 0.005
+    """A non-target object this far above the lowest it has rested this episode was carried along (r14, R-45)."""
+
+    def _check_collateral(self, data: object, episode: _Episode) -> None:
+        """In a scene whose model sets ``r2s_collateral_unclean``: an object the instruction does not name that rises
+        more than :data:`COLLATERAL_LIFT_M` above the lowest it has been this episode (picked up with the target, wedged
+        between the fingers) makes the episode unclean (its text label would be wrong for a policy)."""
+        model = self.model
+        if self._collateral is None:
+            try:
+                on = bool(model.numeric("r2s_collateral_unclean").data[0])
+            except KeyError:
+                on = False
+            self._collateral = {"on": on, "episode": None, "low": {}}
+        state = self._collateral
+        if not state["on"] or self.task.instruction is None:
+            return
+        if state["episode"] is not episode:
+            named = set(getattr(self.task.instruction, "all_targets", None) or (self.task.instruction.object,))
+            others = [n for n in getattr(self.task.layout, "objects", ()) if n not in named]
+            state.update(episode=episode, low={int(model.body(n).id): np.inf for n in others})
+        if self._plan is None and all(np.isinf(v) for v in state["low"].values()):
+            # r16 (D4): not before the episode's first motion: the reset's pile is still falling and bouncing then (a
+            # 7 mm bounce at 0.2 s flagged a CPU the arm never touched); the first plan starts once the pile is still
+            return
+        xpos = data.xpos
+        for body, low in state["low"].items():
+            z = float(xpos[body][2])
+            if z < low:
+                state["low"][body] = z
+            elif z > low + self.COLLATERAL_LIFT_M:
+                import mujoco  # noqa: PLC0415
+
+                reason = f"{mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body)} was carried along"
+                if reason not in episode.reasons:
+                    episode.reasons.append(reason); logger.warning("Demonstrator: {} (the episode is not clean)", reason)
 
     # -- planning off the control tick ------------------------------------
 
@@ -2358,6 +3670,8 @@ class BucketSortDemonstrator:
         snapshot = SceneSnapshot.take(data)
         heights = self.active_arm.heights
         params = DemoParams.sample(rng, heights) if self.randomize else DemoParams.for_heights(heights)
+        if self._operator_timing() >= 18 and self.randomize:  # noqa: PLR2004 - r18: the scene's operator timing here too
+            params = operator_timing(params, rng)
         if len(self.arms) > 1:
             plan = self._plan_with_an_arm(snapshot, instruction, params, dt, rng)
         else:
@@ -2464,25 +3778,73 @@ class BucketSortDemonstrator:
 
     def _start_episode(self, data: object) -> None:
         self._generation = self.task.reset_count
-        seed = int(self._rng.integers(2**63))
+        # r16: the reset's own episode seed (a fixed-seed reset repeats the episode alone or within any batch); the
+        # demonstrator's stream only for a task that does not draw one
+        self._await_go, self._go, self._go_time = False, False, None   # r16: each episode needs its own go
+        self._ahead = None   # r16: a plan made ahead belongs to its episode
+        self._transited = False
+        task_seed = getattr(self.task, "episode_seed", None)
+        seed = int(task_seed) if task_seed is not None else int(self._rng.integers(2**63))
         rng = np.random.default_rng(seed)
         heights = self.active_arm.heights
         params = DemoParams.sample(rng, heights) if self.randomize else DemoParams.for_heights(heights)
+        targets = len(getattr(self.task.instruction, "all_targets", None) or ()) if self.task.instruction is not None else 0
+        if targets > 1:   # r11 (D4 hangs): several objects to sort, the brisk end of each declared range (MULTI_OBJECT_BRISK)
+            params = brisk_for_several(params, rng if self.randomize else None)
+        drift = self._operator_drift_scale()
+        if drift > 0.0 and self.randomize:   # r15 (D7): a scene that asks for the real operator's drift (the reBot desk v2)
+            # its own stream (from the episode's seed): the episode's other draws stay those of a scene without drift
+            params = operator_drift(params, np.random.default_rng([seed, 15]), drift)
+        if self._operator_timing() >= 18 and self.randomize:   # noqa: PLR2004 - r18 (D7): a scene that asks for the operator's timing
+            params = operator_timing(params, np.random.default_rng([seed, 18]))
+            if targets > 1:
+                params = replace(params, start_pause_s=min(params.start_pause_s, brisk_for_several(params, None).start_pause_s))
         self.stats.episodes += 1
+        self._t_anchor = float(data.time)
         self._episode = _Episode(self.stats.episodes, self.task.instruction, rng, params, float(data.time))
         self._plan = None
         self.plans = []
         self._set_phase("settle" if self.task.instruction is not None else "idle", data)
 
+    def _operator_timing(self) -> int:
+        """The custom numeric ``r2s_operator_timing`` of the scene (18: :func:`operator_timing`), else 0; the environment's
+        ``R2S_OPERATOR_TIMING`` overrides it (an audit switch, like ``R2S_SENSOR_NOISE``)."""
+        import os  # noqa: PLC0415
+
+        if os.environ.get("R2S_OPERATOR_TIMING", "") != "":
+            return int(os.environ["R2S_OPERATOR_TIMING"])
+        try:
+            return int(self.model.numeric("r2s_operator_timing").data[0])
+        except KeyError:
+            return 0
+
+    def _operator_drift_scale(self) -> float:
+        """The custom numeric ``r2s_operator_drift`` of the scene (the speed scale of :func:`operator_drift`), else 0."""
+        try:
+            return float(self.model.numeric("r2s_operator_drift").data[0])
+        except KeyError:
+            return 0.0
+
+    def _now(self, data: object) -> float:
+        """The demonstrator's clock: whole physics steps since the episode started, times the step (r16). Sim time keeps
+        running across resets, so ``data.time`` differences carry float rounding that depends on how long the process
+        ran before: a seed alone and as the n-th of a batch could cross a threshold one tick apart. With
+        ``TICK_CLOCK`` off, the raw sim time (r15)."""
+        if not TICK_CLOCK:
+            return float(data.time)
+        step = float(self.model.opt.timestep)
+        return round((float(data.time) - self._t_anchor) / step) * step
+
     def _set_phase(self, phase: Phase, data: object) -> None:
         self._phase = phase
-        self._since = float(data.time)
+        self._since = self._now(data)
         if phase == "settle":
             self._still_since = None  # the arms must stand still anew before this attempt
+            self._pile_still_since = None  # and a pile must be still anew
 
     def _advance(self, data: object, dt: float) -> None:
         episode = self._episode
-        now = float(data.time)
+        now = self._now(data)
         if episode is None or episode.instruction is None or self._phase in {"idle", "stalled"}:
             return
         if self._phase == "settle":
@@ -2493,18 +3855,34 @@ class BucketSortDemonstrator:
             episode.outcome = "success"
             self.stats.successes += 1
         plan = self._plan
+        if plan is not None and self._await_go:
+            # r16: at the start gate. After the go, the episode's start pause (the real operator's), then the plan
+            self._phase = "ready"
+            if self._go and self._go_time is None:
+                self._go_time = now
+                logger.info("Demonstrator: go; start pause {:.3f} s", episode.params.start_pause_s)
+            if self._go_time is not None and now - self._go_time >= episode.params.start_pause_s:
+                self._await_go = False
+            return
         if plan is not None:
             if self._tick < len(plan):
                 self._follow(data, plan, dt)
             elif self._arrived(data, plan, now):
                 self._plan = None
+                if plan.kind == "transit":   # r16: over the next object; its attempt (planned meanwhile) comes next
+                    self._set_phase("settle", data)
+                    return
                 if episode.retry_pending and episode.outcome == "running":
                     episode.retry_pending = False
                     self._set_phase("settle", data)
                 else:
                     self._set_phase("failed" if episode.outcome == "failed" else "done", data)
             return
-        if self._phase == "done" and episode.outcome == "running" and now - self._since >= SETTLE_CHECK_S:
+        if self._phase == "done" and episode.outcome == "running" and (
+            # r16 (D4, D7): judged once the released object rests, with no fixed minimum (r11-r15: at least 0.4 s between
+            # objects, a fixed 1.2 s after the return home); SETTLE_CHECK_S only bounds the wait
+            now - self._since >= SETTLE_CHECK_S or self._resting(data)
+        ):
             self._judge(data, dt)
         elif (
             self._phase == "failed"
@@ -2518,10 +3896,29 @@ class BucketSortDemonstrator:
         """Start the attempt once the pause is over and the object rests; a retry also needs it graspable."""
         episode = self._episode
         still = self._arms_still(data, now)
-        if now - self._since >= episode.params.start_pause_s and self._resting(data) and still:  # type: ignore[union-attr]
+        pause = episode.params.start_pause_s if episode.targets_done == 0 else BETWEEN_PAUSE_S  # type: ignore[union-attr]
+        if self._start_gate and episode.targets_done == 0 and episode.attempt == 0:   # type: ignore[union-attr]
+            pause = 0.0   # r16: the start pause comes after the plan, at the gate
+        if now - self._since >= pause and self._resting(data) and still and self._pile_still(data, now):  # type: ignore[union-attr]
             if episode.attempt == 0:  # type: ignore[union-attr]
+                instruction = episode.instruction  # type: ignore[union-attr]
+                if episode.targets_done > 0 and not self._transited and len(self.arms) == 1:   # type: ignore[union-attr]
+                    # r16 (mid-episode stalls): move over the next object while its attempt is planned
+                    self._transited = True
+                    self._plan_then(data, dt, None, lambda live: self._plan_and_run_transit(live, dt))
+                    return
+                if len(instruction.targets) > 1:   # a kind-level instruction: the pile has settled, pick the best one now
+                    state = self.task.evaluate(self.model, data)
+                    left = [n for n in instruction.targets if state.in_bucket[n] != instruction.bucket]
+                    pick = self._best_target(data, left) if left else instruction.object
+                    if pick != instruction.object:
+                        episode.instruction = replace(instruction, object=pick)  # type: ignore[union-attr]
+                        if not self._resting(data):
+                            return
                 self._begin_attempt(data, dt)
             elif self._graspable(data):
+                self._begin_attempt(data, dt, new_attempt=True)
+            elif len(episode.instruction.targets) > 1 and self._switch_after_failure(data):  # type: ignore[union-attr]
                 self._begin_attempt(data, dt, new_attempt=True)
             else:
                 self._fail(data, f"{episode.reasons[-1]}, and it cannot be picked up where it lies", dt)  # type: ignore[union-attr]
@@ -2568,7 +3965,7 @@ class BucketSortDemonstrator:
         self._q, self._grip = targets[:-1], float(targets[-1])
         self._phase = plan.phases[tick]
         self._tick += 1
-        if plan.kind == "home" or episode is None or episode.instruction is None:
+        if plan.kind in ("home", "transit") or episode is None or episode.instruction is None:
             return
         name = episode.instruction.object
         if self._phase in {"approach", "descend"} and self._planned_object is not None:
@@ -2581,12 +3978,12 @@ class BucketSortDemonstrator:
                 self._replan(data, dt, f"the {name} moved", attempt=True)
             return
         if plan.lift_check is not None and tick == plan.lift_check:
-            self._lift_check_since = float(data.time)
+            self._lift_check_since = self._now(data)
         if self._lift_check_since is not None:
             # The arm lags its targets (the servos, a client's easing): judge the lift once the
             # hand itself is up, or after LIFT_CHECK_WAIT_S at the latest.
             up = float(self.ik.tcp(data)[2]) >= plan.cartesian[plan.lift_check or 0, 2] - 0.005
-            if not up and float(data.time) - self._lift_check_since < LIFT_CHECK_WAIT_S:
+            if not up and self._now(data) - self._lift_check_since < LIFT_CHECK_WAIT_S:
                 return
             self._lift_check_since = None
             if not self._holding(data, name, lifted=True):
@@ -2606,7 +4003,7 @@ class BucketSortDemonstrator:
             Whether the demonstrator just stalled.
         """
         error = float(np.abs(np.array(data.qpos[self.ik.qpos_adr]) - plan.q[max(tick - 1, 0)]).max())
-        now = float(data.time)
+        now = self._now(data)
         if error <= STALL_ERROR:
             self._lag_since = None
             return False
@@ -2650,7 +4047,8 @@ class BucketSortDemonstrator:
             self._plan_end = now
         error = float(np.abs(np.array(data.qpos[self.ik.qpos_adr]) - plan.q[-1]).max())
         waited = now - self._plan_end
-        if (error < 0.02 and waited >= 0.1) or (waited >= CATCH_UP_S and error <= STALL_ERROR):  # noqa: PLR2004
+        arrive_wait = self._episode.params.arrive_wait_s if self._episode is not None else 0.1
+        if (error < 0.02 and waited >= arrive_wait) or (waited >= CATCH_UP_S and error <= STALL_ERROR):  # noqa: PLR2004
             self._plan_end = None
             return True
         if waited >= CATCH_UP_S:
@@ -2666,15 +4064,90 @@ class BucketSortDemonstrator:
             episode.outcome = "success"  # type: ignore[union-attr]
             self.stats.successes += 1
             return
-        others = [name for name, color in state.in_bucket.items() if color is not None and name != instruction.object]
+        targets = instruction.all_targets
+        start = self.task.start_in_bucket
+        others = [
+            name
+            for name, color in state.in_bucket.items()
+            if color is not None and color != start.get(name) and name not in targets
+        ]
         if others:
             self._fail(data, f"the {others[0]} ended up in a bucket", dt)
             return
+        wrong = [name for name in targets if name != instruction.object and state.in_bucket[name] not in (None, instruction.bucket)]
+        if wrong:
+            self._fail(data, f"the {wrong[0]} ended up in the {state.in_bucket[wrong[0]]} bucket", dt)
+            return
         where = state.in_bucket[instruction.object]
         if where == instruction.bucket:
-            return  # in place but still moving (or touched): judge again next tick
+            if not state.resting[instruction.object]:
+                return  # in place but still moving (or touched): judge again next tick
+            left = [name for name in targets if state.in_bucket[name] != instruction.bucket]
+            if left:   # a kind-level instruction: on to the next object of the kind
+                self._next_target(data, left)
+            return
         reason = f"the object landed in the {where} bucket" if where else "the object landed outside the bucket"
         self._retry_or_fail(data, reason, dt)
+
+    def _next_target(self, data: object, left: list[str]) -> None:
+        """Pick the next object of a kind-level instruction and start on it: the highest graspable one (the top of a
+        pile first), then the nearest to the arm's base; with none graspable, the highest (its attempt may fail)."""
+        episode = self._episode
+        pick = self._best_target(data, left)
+        logger.info("Demonstrator: {} placed; next {} ({} left)", episode.instruction.object, pick, len(left))  # type: ignore[union-attr]
+        episode.instruction = replace(episode.instruction, object=pick)  # type: ignore[union-attr, arg-type]
+        episode.attempt = 0  # type: ignore[union-attr]
+        episode.replans = 0  # type: ignore[union-attr]
+        episode.targets_done += 1  # type: ignore[union-attr]
+        self._transited = False
+        self._set_phase("settle", data)
+
+    def _switch_after_failure(self, data: object) -> bool:
+        """A kind-level retry whose object cannot be picked up where it now lies: go on with another of the kind still
+        on the table that can (this attempt counts); ``False`` when none can."""
+        episode = self._episode
+        instruction = episode.instruction  # type: ignore[union-attr]
+        state = self.task.evaluate(self.model, data)
+        left = [
+            n for n in instruction.targets
+            if n != instruction.object and state.in_bucket[n] != instruction.bucket and self._graspable_name(data, n)
+            and state.resting[n]
+        ]
+        if not left:
+            return False
+        pick = self._best_target(data, left)
+        logger.info("Demonstrator: {} cannot be picked up where it lies; {} instead", instruction.object, pick)
+        episode.instruction = replace(instruction, object=pick)  # type: ignore[union-attr]
+        return True
+
+    def _best_target(self, data: object, left: list[str]) -> str:
+        """The object of a kind-level instruction to pick next: the highest graspable one (the top of a pile first),
+        then the nearest to the arm's base; with none graspable, the highest."""
+        bodies = {name: self._object_body[name] for name in left}
+        graspable = [name for name in left if self._graspable_name(data, name)]
+        free = [name for name in graspable if not self._covered(data, name)]
+        return max(
+            free or graspable or left,
+            key=lambda name: (round(float(data.xpos[bodies[name]][2]), 3), -float(np.hypot(*data.xpos[bodies[name]][:2]))),
+        )
+
+    def _covered(self, data: object, name: str) -> bool:
+        """Whether another object lies on top of *name*: its centre over *name*'s footprint and clearly higher. A
+        grasp there closes on both, or the one on top pins it down."""
+        footprints = self.task.footprints(self.model)
+        here = data.xpos[self._object_body[name]]
+        own = footprints[name]
+        for other, body in self._object_body.items():
+            if other == name or other not in footprints:
+                continue
+            there = data.xpos[body]
+            if (
+                float(np.hypot(*(there[:2] - here[:2]))) < 0.7 * (own.radius + footprints[other].radius)
+                and there[2] > here[2] + own.half_height
+                and there[2] < 0.15  # noqa: PLR2004 - on the table, not parked or in the air
+            ):
+                return True
+        return False
 
     # -- attempts ---------------------------------------------------------
 
@@ -2686,6 +4159,52 @@ class BucketSortDemonstrator:
             return np.array([*tcp, yaw, self._grip])
         return np.array([*tcp, yaw, self._grip, self.ik.tilt()])
 
+    def _set_go_home(self, data: object) -> None:
+        """Whether this attempt goes home at its end (:attr:`DemoParams.go_home`): not while another object of a
+        kind-level instruction is still to be sorted."""
+        episode = self._episode
+        instruction = episode.instruction  # type: ignore[union-attr]
+        targets = tuple(getattr(instruction, "all_targets", None) or (instruction.object,))
+        go = True
+        if len(targets) > 1:
+            state = self.task.evaluate(self.model, data)
+            go = not [n for n in targets if n != instruction.object and state.in_bucket.get(n) != instruction.bucket]
+        if episode.params.go_home != go:  # type: ignore[union-attr]
+            episode.params = replace(episode.params, go_home=go)  # type: ignore[union-attr]
+
+    PILE_STILL_MPS = 0.005
+    PILE_STILL_RADPS = 0.05
+    PILE_STILL_MPS2 = 0.5
+    PILE_STILL_S = 0.0
+    PILE_STILL_MAX_S = 3.0
+
+    def _pile_still(self, data: object, now: float) -> bool:
+        """In a pile (r14, T6): every placed object below :data:`PILE_STILL_MPS` and :data:`PILE_STILL_RADPS` before the
+        hand sets off (a neighbour still creeping or toppling was the commonest pre-grasp "push", with no hand contact);
+        at most :data:`PILE_STILL_MAX_S` after the settle phase began. Scattered tables: True. r16 (D4, D7): a state, no
+        fixed duration (r14-r15 held the linear test for 0.3 s); the angular test catches a toppling body at its turn, the
+        acceleration test (:data:`PILE_STILL_MPS2`) a body at rest only for the instant: a reset's spawned pile (zero
+        velocity, falling at g) or a bounce's apex."""
+        layout = getattr(self.task, "layout", None)
+        if layout is None or not getattr(layout, "pile", False):
+            return True
+        if now - self._since >= self.PILE_STILL_MAX_S:
+            return True
+        model = self.model
+        if self._pile_dofs is None or self._pile_dofs[0] is not layout:
+            dofs = [int(model.jnt_dofadr[model.joint(f"{n}:joint").id]) for n in layout.objects]
+            self._pile_dofs = (layout, np.array(dofs, dtype=int))
+        dofs = self._pile_dofs[1]
+        qvel = np.asarray(data.qvel)
+        speed = np.linalg.norm(qvel[dofs[:, None] + np.arange(3)], axis=1) if len(dofs) else np.zeros(0)
+        spin = np.linalg.norm(qvel[dofs[:, None] + 3 + np.arange(3)], axis=1) if len(dofs) else np.zeros(0)
+        accel = np.linalg.norm(np.asarray(data.qacc)[dofs[:, None] + np.arange(3)], axis=1) if len(dofs) else np.zeros(0)
+        if (speed < self.PILE_STILL_MPS).all() and (spin < self.PILE_STILL_RADPS).all() and (accel < self.PILE_STILL_MPS2).all():
+            if self._pile_still_since is None: self._pile_still_since = now
+            return now - self._pile_still_since >= self.PILE_STILL_S
+        self._pile_still_since = None
+        return False
+
     def _resting(self, data: object) -> bool:
         name = self._episode.instruction.object  # type: ignore[union-attr]
         return bool(self.task.evaluate(self.model, data).resting[name])
@@ -2696,7 +4215,10 @@ class BucketSortDemonstrator:
         Returns:
             ``True`` on the table, in reach, out of the buckets and with its long side level.
         """
-        name = self._episode.instruction.object  # type: ignore[union-attr]
+        return self._graspable_name(data, self._episode.instruction.object)  # type: ignore[union-attr]
+
+    def _graspable_name(self, data: object, name: str) -> bool:
+        """:meth:`_graspable` for object *name*."""
         body = self._object_body[name]
         position = data.xpos[body]
         rotation = data.xmat[body].reshape(3, 3)
@@ -2725,7 +4247,8 @@ class BucketSortDemonstrator:
         logger.info("Demonstrator: {}; retrying", reason)
         self.stats.retries += 1
         if self.randomize:
-            episode.params = DemoParams.sample(episode.rng, self.active_arm.heights)
+            episode.params = _timed_like(replace(DemoParams.sample(episode.rng, self.active_arm.heights), **_drift_of(episode.params)),
+                                         episode.params, episode.rng)
         episode.retry_pending = True
         self._go_home(data, dt)
 
@@ -2736,6 +4259,9 @@ class BucketSortDemonstrator:
             return
         if episode.outcome != "failed":
             self.stats.failures += 1
+            note = getattr(self.task, "note_failure", None)
+            if note is not None:
+                note()   # a stratified retry keeps this episode's stratum for the next layout
         episode.outcome, episode.failure = "failed", reason
         logger.info("Demonstrator: episode {} failed: {}", episode.serial, reason)
         self._go_home(data, dt)
@@ -2800,6 +4326,7 @@ class BucketSortDemonstrator:
         episode = self._episode
         if episode is None or episode.instruction is None:
             return
+        self._set_go_home(data)
         if new_attempt or episode.attempt == 0:
             episode.attempt += 1
             self.stats.attempts += 1
@@ -2815,15 +4342,200 @@ class BucketSortDemonstrator:
                 self._fail(data, f"no arm reaches the {instruction.object} and the {instruction.bucket} bucket", dt)
                 return
         else:
-            plan = self.plan_attempt(
-                snapshot, self._q, self._start_state(), episode.instruction, episode.params, dt, episode.rng
-            )
+            plan = self._take_ahead(snapshot) if self._ahead is not None else None   # r16: planned ahead, re-checked
+            if plan is None:
+                plan = self.plan_attempt(
+                    snapshot, self._q, self._start_state(), episode.instruction, episode.params, dt, episode.rng
+                )
+            if self._gated and (plan.unreached or plan.pos_error > OUT_OF_REACH) and len(episode.instruction.targets) > 1:
+                plan = self._another_target_plan(data, snapshot, plan, dt)
+            if _cuts_objects(plan) and len(episode.instruction.targets) > 1:
+                plan = self._another_target_plan(data, snapshot, plan, dt, cut=True)
+            if _cuts_objects(plan):   # r11: a glitch is worse than a failed attempt (the recorder discards those)
+                cut = -min(plan.clearance.get("objects", 0.0), plan.clearance.get("held_objects", 0.0)) * 1000
+                self._fail(data, f"every plan cuts into another object (by {cut:.0f} mm)", dt)
+                return
+            if _hits_bucket(plan) and len(episode.instruction.targets) > 1:   # r16: another target first, this one later
+                plan = self._another_target_plan(data, snapshot, plan, dt, bucket=True)
+            if _hits_bucket(plan):   # r16: the last target (or none other workable): refused, not run into the bucket
+                depth = -plan.clearance.get("bucket", 0.0) * 1000
+                self._fail(data, f"every plan brings the hand into a bucket (by {depth:.0f} mm)", dt)
+                return
         self.planner.load(snapshot)
         position, rotation = self.planner.object_pose(episode.instruction.object)
         self._rest_z = float(position[2])
         self._planned_object = position.copy()
         self._planned_axis = self.planner.grasp_axis_yaw(episode.instruction.object, rotation)
         self._run(plan, data, brake)
+
+    def _plan_and_run_transit(self, data: object, dt: float) -> None:
+        """r16 (mid-episode stalls; coordinator's conditions): a collision-checked move over the next object, at the carry
+        height, as an operator moves over it; its attempt is planned meanwhile from where the move ends (:meth:`_plan_ahead`),
+        and used only after the same exact clearance sweep on the actual scene (:meth:`_take_ahead`). A move that fails a
+        check is not run: the attempt is planned from here as before."""
+        episode = self._episode
+        instruction = episode.instruction  # type: ignore[union-attr]
+        snapshot = SceneSnapshot.take(data)
+        start = self._start_state(); p = episode.params  # type: ignore[union-attr]
+        process = self._plan_process_for_call()   # r17: in the planning worker when there is one (not on a GIL thread)
+        plan = None
+        if process is not None:
+            plan = process.plan_transit(self._active, snapshot, self._q, start, instruction.object, instruction.bucket, p, dt, self.model)
+        if plan is None:
+            plan = _plan_transit_core(self.planner, snapshot, start, self._q, instruction.object, instruction.bucket, p, dt)
+        if not plan.ok:
+            logger.info("Demonstrator: no move over the {} ({}); planning from here", instruction.object, plan.problems[:2])
+            return
+        self._run(plan, data)
+        self._plan_ahead(data, plan, target=instruction.object)
+
+    def _plan_ahead(self, data: object, plan: JointPlan, *, target: str | None = None) -> None:
+        """r16 (plan ahead): once the current object is released, plan the attempt on the next object of a kind-level
+        instruction, on a thread, from a predicted scene: every object where it is now, the released one out of the way
+        (it is falling into the bucket), the arm where this plan ends. :meth:`_take_ahead` uses it only for the same
+        target and start and only after the exact clearance sweep on the actual scene passes."""
+        import threading  # noqa: PLC0415
+
+        episode = self._episode
+        self._ahead = None
+        if episode is None or episode.instruction is None or len(self.arms) > 1:
+            return
+        instruction = episode.instruction
+        targets = tuple(getattr(instruction, "all_targets", None) or (instruction.object,))
+        if len(targets) < 2:
+            return
+        state = self.task.evaluate(self.model, data)
+        snapshot = SceneSnapshot.take(data)
+        if target is not None:   # the transit's: the attempt on this target from where the move ends
+            pick = target
+        else:
+            left = [n for n in targets if n != instruction.object and state.in_bucket.get(n) != instruction.bucket]
+            if not left:
+                return
+            pick = self._best_target(data, left)
+            body = self._object_body[instruction.object]
+            adr = int(self.model.jnt_qposadr[self.model.body_jntadr[body]])
+            snapshot.qpos[adr : adr + 3] = (0.0, 0.0, -5.0)   # the released object: out of the way
+        last = plan.targets(len(plan) - 1)
+        q_end, grip_end = np.asarray(last[:-1], dtype=np.float64).copy(), float(last[-1])
+        saved = (self._q, self._grip)
+        self._q, self._grip = q_end, grip_end
+        try:
+            start = self._start_state()
+        finally:
+            self._q, self._grip = saved
+        go_home = not [n for n in targets if n != pick and (target is not None or n != instruction.object) and state.in_bucket.get(n) != instruction.bucket]
+        params = replace(episode.params, go_home=go_home)
+        rng = np.random.Generator(np.random.PCG64()); rng.bit_generator.state = episode.rng.bit_generator.state
+        nxt = replace(instruction, object=pick)
+        a_pick = int(self.model.jnt_qposadr[self.model.body_jntadr[self._object_body[pick]]])
+        job: dict = {"target": pick, "q": q_end, "params": params, "rng": rng, "plan": None, "serial": episode.serial,
+                     "pick_adr": a_pick, "pick_pose": snapshot.qpos[a_pick : a_pick + 7].copy()}
+        process = self._plan_process_for_call()
+        if process is None and self._ahead_planner is None:
+            arm = self.active_arm
+            self._ahead_planner = Planner(self.model, arm, tuple(o for o in self.arms if o is not arm))
+
+        def work() -> None:
+            result = None
+            if process is not None:
+                result = process.plan_attempt(self._active, snapshot, q_end, start, nxt, params, plan.dt, rng, self.model)
+            if result is None:
+                result = _plan_attempt_core(self._ahead_planner, self.active_arm, self._gated, snapshot, q_end, start, nxt, params, plan.dt, rng)
+            job["plan"] = result
+
+        job["thread"] = threading.Thread(target=work, name="plan-ahead", daemon=True)
+        job["thread"].start()
+        self._ahead = job
+
+    def _take_ahead(self, snapshot: SceneSnapshot) -> JointPlan | None:
+        """r16 (plan ahead): the plan made ahead for this attempt, if it is for the same object, start and parameters,
+        it passed every check, and the same clearance sweep as a fresh plan's, on the actual scene (*snapshot*), passes
+        too; else ``None`` (plan afresh). Runs in the planning job (it waits for the plan made ahead if still running)."""
+        job, self._ahead = self._ahead, None
+        episode = self._episode
+        if job is None or episode is None:
+            return None
+        why = ("another episode" if job["serial"] != episode.serial else "another target" if job["target"] != episode.instruction.object
+               else "not a first attempt" if episode.attempt != 1 else "another start" if self._q is None or not np.allclose(job["q"], self._q, atol=1e-9)
+               else "other parameters" if job["params"] != episode.params else None)
+        if why is not None:
+            self.stats.ahead_replanned += 1; self.stats.ahead_why[why] = self.stats.ahead_why.get(why, 0) + 1
+            return None
+        a, was = job["pick_adr"], job["pick_pose"]; now = snapshot.qpos[a : a + 7]
+        turned = 2.0 * np.degrees(np.arccos(min(1.0, abs(float(np.dot(was[3:], now[3:]))))))
+        moved = np.linalg.norm(now[:3] - was[:3]) > AHEAD_MOVED_M or turned > AHEAD_TURNED_DEG
+        if moved:   # the target moved since (the drop nudged it): the grasp was aimed at where it was (other objects:
+            # the clearance re-check below)
+            self.stats.ahead_replanned += 1; self.stats.ahead_why["the target moved"] = self.stats.ahead_why.get("the target moved", 0) + 1
+            return None
+        job["thread"].join()
+        plan = job["plan"]
+        # r17 (live stalls): a best-effort plan made ahead is used too when the scene it was made for is the actual one:
+        # the target where it was (float tolerance, not the 2 mm a passing plan may move: the grasp's IK aims at it) and
+        # the exact clearance re-check below reproducing every planning-time clearance and problem; a fresh plan would
+        # search the same space from the same state and random draws
+        best_effort = plan is not None and not plan.ok and getattr(plan, "held_ticks", "missing") != "missing" and AHEAD_BEST_EFFORT
+        if best_effort:   # r17 (coordinator: a quality check): the target where the plan aimed (its IK holds), within tolerance
+            moved_m = float(np.linalg.norm(now[:3] - was[:3]))
+            if not (plan.problems and moved_m <= AHEAD_QUALITY_M and turned <= AHEAD_QUALITY_DEG):
+                best_effort = False
+        if plan is None or (not plan.ok and not best_effort) or getattr(plan, "held_ticks", "missing") == "missing":
+            why = "no plan" if plan is None else f"it failed a check: {plan.problems[0][:60]}" if not plan.ok else "no held ticks"
+            self.stats.ahead_replanned += 1; self.stats.ahead_why[why] = self.stats.ahead_why.get(why, 0) + 1
+            return None
+        planner = self.planner
+        planner.load(snapshot)
+        held_width = planner.held_width
+        planner.held_width = plan.held_width
+        before = list(plan.problems); clearance_before = dict(plan.clearance)
+        if best_effort:   # the re-check recomputes the clearance problems from scratch
+            plan.problems = [q for q in plan.problems if "clearance" not in q]
+        try:
+            planner._check_clearance(plan, episode.instruction.object, plan.held_ticks)
+        finally:
+            planner.held_width = held_width
+        if best_effort and (set(plan.clearance) != set(clearance_before)
+                            or any(plan.clearance[k] < clearance_before[k] - AHEAD_QUALITY_M for k in clearance_before)):
+            plan.problems, plan.clearance = before, clearance_before
+            self.stats.ahead_replanned += 1; self.stats.ahead_why["a best effort not reproduced"] = self.stats.ahead_why.get("a best effort not reproduced", 0) + 1
+            return None
+        if plan.problems != before:   # the actual scene fails a clearance the predicted one passed
+            self.stats.ahead_replanned += 1; self.stats.ahead_why["the re-check failed"] = self.stats.ahead_why.get("the re-check failed", 0) + 1
+            logger.info("Demonstrator: the plan made ahead fails on the actual scene ({}); planning afresh", plan.problems[len(before):])
+            return None
+        episode.rng.bit_generator.state = job["rng"].bit_generator.state   # as if planned now
+        self.stats.ahead_used += 1
+        if best_effort:
+            self.stats.ahead_best_effort_used = getattr(self.stats, "ahead_best_effort_used", 0) + 1
+            self._report_problems(plan)
+        logger.info("Demonstrator: plan ahead used for {} (used {}, planned afresh {}: {})", episode.instruction.object,
+                    self.stats.ahead_used, self.stats.ahead_replanned, self.stats.ahead_why)
+        return plan
+
+    def _another_target_plan(
+        self, data: object, snapshot: SceneSnapshot, plan: JointPlan, dt: float, *, cut: bool = False, bucket: bool = False
+    ) -> JointPlan:
+        """A kind-level instruction whose chosen object is out of reach: plan for its other objects still on the table
+        (graspable ones, highest first) and switch to the first one the hand reaches; else keep *plan* (it fails)."""
+        episode = self._episode
+        instruction = episode.instruction  # type: ignore[union-attr]
+        state = self.task.evaluate(self.model, data)
+        left = [
+            n for n in instruction.targets
+            if n != instruction.object and state.in_bucket[n] != instruction.bucket and self._graspable_name(data, n)
+        ]
+        left.sort(key=lambda n: -float(data.xpos[self._object_body[n]][2]))
+        for name in left:
+            other = replace(instruction, object=name)
+            candidate = self.plan_attempt(snapshot, self._q, self._start_state(), other, episode.params, dt, episode.rng)  # type: ignore[union-attr]
+            if (not candidate.unreached and candidate.pos_error <= OUT_OF_REACH and not (cut and _cuts_objects(candidate))
+                    and not (bucket and (_hits_bucket(candidate) or _cuts_objects(candidate)))):
+                why = "boxed in" if cut else ("against a bucket" if bucket else "out of reach")
+                logger.info("Demonstrator: {} {}; {} first", instruction.object, why, name)
+                episode.instruction = other  # type: ignore[union-attr]
+                return candidate
+        return plan
 
     def _plan_with_an_arm(
         self, snapshot: SceneSnapshot, instruction: Instruction, params: DemoParams, dt: float, rng: np.random.Generator
@@ -2944,54 +4656,16 @@ class BucketSortDemonstrator:
         Returns:
             The first plan that passes every check, else the one with the fewest problems.
         """
-        planner = self.planner
-        planner.load(snapshot)
-        position, rotation = planner.object_pose(instruction.object)
-        axis = planner.grasp_axis_yaw(instruction.object, rotation) + params.yaw_noise
-        candidates = planner.yaw_candidates(axis, float(start[3]), position[:2])
-        if len(candidates) == 2:  # noqa: PLR2004
-            margins = [planner.key_margin(q, instruction, params, yaw) for yaw in candidates]
-            if abs(margins[0] - margins[1]) < np.radians(10.0):
-                candidates = candidates if params.yaw_choice < 0.5 else candidates[::-1]  # noqa: PLR2004
-            elif margins[1] > margins[0]:
-                candidates = candidates[::-1]
-        safer, safest = self.active_arm.heights.safe
-        variants = [
-            params,
-            replace(params, release_z=max(params.release_z, safer[0]), carry_z=max(params.carry_z, safer[1])),
-            replace(
-                params, release_z=safest[0], carry_z=safest[1], blend=0.0, place_offset=(0.0, -0.01), grasp_offset=0.0
-            ),
-        ]
-        if rng is not None:
-            variants += [DemoParams.sample(rng, self.active_arm.heights) for _ in range(2)]
-        best: JointPlan | None = None
-        eligible: JointPlan | None = None
-        """Where :attr:`_gated`, the best plan that may run at all (:meth:`_may_run`)."""
-        for variant in variants:
-            for yaw in candidates:
-                planner.load(snapshot)
+        plan = None
+        process = self._plan_process_for_call()
+        if process is not None:
+            plan = process.plan_attempt(self._active, snapshot, q, start, instruction, params, dt, rng, self.model)
+        if plan is None:   # in this process (no worker, or the worker is unavailable)
+            plan = _plan_attempt_core(self.planner, self.active_arm, self._gated, snapshot, q, start, instruction, params, dt, rng)
+        if report and not plan.ok:
+            self._report_problems(plan)
+        return plan
 
-                def build(
-                    slow: dict[str, float], variant: DemoParams = variant, yaw: float = yaw
-                ) -> tuple[MotionScript, float]:
-                    return planner.attempt_script(start, instruction, variant, grasp_yaw=yaw, slow=slow)
-
-                plan = planner.checked(
-                    build, q, dt, kind="attempt", target=instruction.object, bucket=instruction.bucket
-                )
-                plan.yaw_grasp = yaw
-                if plan.ok:
-                    return plan
-                if best is None or _severity(plan) < _severity(best):
-                    best = plan
-                if self._gated and self._may_run(plan) and (eligible is None or _severity(plan) < _severity(eligible)):
-                    eligible = plan
-        if eligible is not None:
-            best = eligible  # a plan that would be refused must not hide one that may run
-        if report:
-            self._report_problems(best)  # type: ignore[arg-type]
-        return best  # type: ignore[return-value]
 
     @property
     def _gated(self) -> bool:
@@ -3146,6 +4820,12 @@ class BucketSortDemonstrator:
         self._lag_since = None
         self._lift_check_since = None
         self._set_phase(plan.phases[0], data)
+        episode = self._episode
+        if (self._start_gate and plan.kind == "attempt" and episode is not None and episode.targets_done == 0
+                and episode.attempt == 1):
+            # r16 (plan before record): planned; hold here until the recorder's go, then the start pause, then move
+            self._await_go, self._go_time = True, None
+            self._phase = "ready"
 
 
 __all__ = [

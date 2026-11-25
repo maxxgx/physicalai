@@ -204,6 +204,7 @@ class TestInstructions:
             "bucket": "black",
             "text": "put the 9 V battery in the black bucket",
             "canonical_text": "put the 9 V battery in the black bucket",
+            "bucket_shown": "black",   # the colour the episode shows (randomised looks recolour buckets)
         }
         worded = Instruction("battery", "black", wording="Drop the battery in the black bin.")
         assert worded.text == "Drop the battery in the black bin."

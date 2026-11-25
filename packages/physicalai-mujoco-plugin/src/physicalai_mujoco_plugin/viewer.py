@@ -70,6 +70,8 @@ class ViewerService:
         self._model: object | None = None
         self._sync_failed = False
         self._panel_failed = False
+        self.hidden_geoms: frozenset[int] = frozenset()
+        """Geoms left out of the browser viewer (a real2sim splat behind it shows them); the cameras still draw them."""
 
     @property
     def active(self) -> bool:
@@ -227,7 +229,7 @@ class ViewerService:
         server.gui.reset()
         server.scene.reset()
 
-        scene = ViserMujocoScene(server, self._model, num_envs=1)
+        scene = ViserMujocoScene(server, _without_geoms(self._model, self.hidden_geoms), num_envs=1)
         scene.camera_tracking_enabled = False
         # mjviser's default refresh re-renders from the viser thread while the sim thread may be
         # stepping the same data; the sim loop re-renders at the control rate anyway.
@@ -363,6 +365,23 @@ class ViewerService:
             for (body_id, *_rest), handle in (getattr(scene, attribute, None) or {}).items():
                 handle.position = np.asarray(data.xpos[body_id], dtype=np.float64)
                 handle.wxyz = np.asarray(data.xquat[body_id], dtype=np.float64)
+
+
+def _without_geoms(model: object, geoms: frozenset[int]) -> object:
+    """``model``, or a copy in which ``geoms`` are fully transparent boxes (mjviser skips those; a plane would
+    still be drawn as its grid)."""
+    if not geoms:
+        return model
+    import copy  # noqa: PLC0415
+
+    import mujoco  # noqa: PLC0415
+
+    shown = copy.deepcopy(model)
+    for g in geoms:
+        shown.geom_rgba[g, 3] = 0.0
+        if shown.geom_type[g] == mujoco.mjtGeom.mjGEOM_PLANE:
+            shown.geom_type[g] = mujoco.mjtGeom.mjGEOM_BOX
+    return shown
 
 
 def _cast_fixed_shadows(scene: object) -> None:

@@ -191,11 +191,21 @@ def place_home(model: object, data: object, binding: RobotBinding) -> None:
         if joint_id >= 0:
             address = int(model.jnt_qposadr[joint_id])
             data.qpos[address : address + len(values)] = values
+            if len(values) == 1 and model.jnt_limited[joint_id]:
+                # a profile may narrow a joint's range (the reBot's measured finger travel): start inside it
+                low, high = (float(v) for v in model.jnt_range[joint_id])
+                data.qpos[address] = min(max(float(data.qpos[address]), low), high)
             dof = int(model.jnt_dofadr[joint_id])
             data.qvel[dof : dof + (len(values) - 1 if len(values) > 1 else 1)] = 0.0
     for actuator, value in binding.layout.home_ctrl.items():
         actuator_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator)
         if actuator_id >= 0:
+            joint_id = int(model.actuator_trnid[actuator_id, 0])
+            position = int(model.actuator_biastype[actuator_id]) == int(mujoco.mjtBias.mjBIAS_AFFINE)
+            if position and int(model.actuator_trntype[actuator_id]) == int(mujoco.mjtTrn.mjTRN_JOINT) and model.jnt_limited[joint_id]:
+                # a position target below a narrowed range would hold the joint pressed into its limit
+                low, high = (float(v) for v in model.jnt_range[joint_id])
+                value = min(max(float(value), low), high)
             data.ctrl[actuator_id] = value
     base = binding.layout.base
     if base is not None:

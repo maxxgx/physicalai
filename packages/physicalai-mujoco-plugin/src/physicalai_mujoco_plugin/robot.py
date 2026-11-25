@@ -110,6 +110,7 @@ class MuJoCoRobot(OperatorControls):
         exit_with_pid: int | None = None,
         grip_force_n: float | None = None,
         http_fallback_port: int | None = None,
+        appearance: str | None = None,
     ) -> None:
         """Create a disconnected simulation.
 
@@ -148,6 +149,8 @@ class MuJoCoRobot(OperatorControls):
                 ``physicalai-mujoco start --exit-with-parent`` passes its own PID.
             grip_force_n: The Franka Hand's grasp force per finger in newtons, above 0 and at most
                 140; ``None`` keeps the real hand's 70 N. Only the Franka profiles have the hand.
+            appearance: A real2sim kit file (``real2sim.json``): the camera streams are composited over its splat
+                (:mod:`.real2sim.desk_compositor`) instead of MuJoCo's plain render.
             http_fallback_port: Port for the HTTP server when ``http_port`` is taken, so the server
                 still starts when another process took ``http_port`` after it was found free;
                 ``None`` runs without the server then.
@@ -183,7 +186,7 @@ class MuJoCoRobot(OperatorControls):
             "overview": overview, "enable_viewer": enable_viewer, "viser_host": viser_host, "viser_port": viser_port,
             "viewer_theme": viewer_theme, "http_host": http_host, "http_port": http_port, "owner_name": owner_name,
             "studio_url": studio_url, "seed": seed, "exit_with_pid": exit_with_pid,
-            "grip_force_n": grip_force_n, "http_fallback_port": http_fallback_port,
+            "grip_force_n": grip_force_n, "http_fallback_port": http_fallback_port, "appearance": appearance,
         }  # fmt: skip
         """Constructor arguments, for pickling (``__getstate__``)."""
         self._profile: RobotProfile = get_profile(profile)
@@ -223,6 +226,12 @@ class MuJoCoRobot(OperatorControls):
         )
         self._objects = SceneObjects(self._area, self._state_lock)
         self._cameras = CameraService(self._camera_arg or [])
+        self._appearance = appearance
+        self._viewer_background: object | None = None
+        if appearance is not None:
+            from physicalai_mujoco_plugin.real2sim.desk_compositor import compositor_factory  # noqa: PLC0415
+
+            self._cameras.compositor_factory = compositor_factory(appearance)
         self._viewer: ViewerService | None = None
         self._http_server: HttpServer | None = None
         self._watcher: SceneXmlWatcher | None = None
@@ -330,10 +339,37 @@ class MuJoCoRobot(OperatorControls):
                 panel_state=self._panel_state,
                 key_callback=self._key_callback,
             )
+            if self._appearance is not None:
+                from physicalai_mujoco_plugin.real2sim.desk_compositor import (  # noqa: PLC0415
+                    DeskKit,
+                    apply_look,
+                    splat_shown_geoms,
+                )
+
+                kit = DeskKit.from_json(self._appearance)
+                if kit.look is not None:
+                    apply_look(sim.model, kit.look)  # the arm's calibrated colours, before the viewer uploads them
+                self._viewer.hidden_geoms = splat_shown_geoms(sim.model)
             if not self._viewer.open(sim.model, sim.data):
                 self._viewer, self._enable_viewer = None, False
+            elif self._appearance is not None and self._viewer.server is not None:
+                self._viewer_background = self._open_viewer_background(sim)
         self._cameras.start(sim.model, sim.data)
         self._start_http_server()
+
+    def _open_viewer_background(self, sim: object) -> object | None:
+        """The desk splat behind the browser viewer (Metal); ``None`` where it cannot run (the viewer shows the meshes)."""
+        from physicalai_mujoco_plugin.real2sim.desk_compositor import DeskKit, DeskViewerBackground  # noqa: PLC0415
+
+        try:
+            kit = DeskKit.from_json(self._appearance)
+            return DeskViewerBackground(self._viewer.server, sim.model, sim.data, kit, home=kit.viewer_home)
+        except Exception as exc:  # noqa: BLE001 - the viewer is optional
+            logger.warning("Splat viewer background unavailable ({}); showing the sim meshes alone", exc)
+            if self._viewer is not None:
+                self._viewer.hidden_geoms = frozenset()
+                self._viewer.rebuild(sim.model, sim.data)
+            return None
 
     def disconnect(self) -> None:
         """Stop the services and release the simulation; repeated calls are harmless."""
@@ -542,16 +578,33 @@ class MuJoCoRobot(OperatorControls):
             overview=self._overview,
         )
 
-    @staticmethod
-    def _default_cameras(sim: Sim) -> list[CameraConfig]:
+    def _default_cameras(self, sim: Sim) -> list[CameraConfig]:
         """Return the default streams, or none where MuJoCo cannot render (a headless host without EGL).
 
-        A failed probe runs again on the next connect or scene switch.
+        A failed probe runs again on the next connect or scene switch. An appearance kit may set ``camera_fps``: a
+        recorder sampling the latest frame at 30 Hz needs a source somewhat faster than that, or it records repeats.
 
         Returns:
             The streams of :func:`~physicalai_mujoco_plugin.sim.default_cameras`, or an empty list.
         """
-        return default_cameras(sim) if offscreen_rendering_available() else []
+        configs = default_cameras(sim) if offscreen_rendering_available() else []
+        fps = self._kit_camera_fps()
+        if fps:
+            from dataclasses import replace  # noqa: PLC0415
+
+            configs = [replace(c, fps=fps) for c in configs]
+        return configs
+
+    def _kit_camera_fps(self) -> int | None:
+        if self._appearance is None:
+            return None
+        import json  # noqa: PLC0415
+
+        try:
+            fps = json.loads(Path(self._appearance).expanduser().read_text()).get("camera_fps")
+        except (OSError, ValueError):
+            return None
+        return int(fps) if fps else None
 
     def _bind_scene(self) -> None:
         """Bind the scene objects, episode automation and live XML watch to the current simulation."""

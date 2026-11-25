@@ -149,6 +149,14 @@ class SetAutopilotCommand:
 
 
 @dataclass(frozen=True)
+class StartGateCommand:
+    """r16 (plan before record): hold each episode's first planned attempt until a go (``enabled``), and give the go."""
+
+    enabled: bool | None = None
+    go: bool = False
+
+
+@dataclass(frozen=True)
 class SetStudioRecordingCommand:
     """Switch automatic Studio episode recording on with `options`, or off with ``None``."""
 
@@ -180,6 +188,7 @@ SimCommand = (
     | SetBeltSpeedCommand
     | SetObjectPoseCommand
     | SetAutopilotCommand
+    | StartGateCommand
     | SetStudioRecordingCommand
     | ReplayCommand
     | StopReplayCommand
@@ -199,6 +208,14 @@ class AutopilotRequest(BaseModel):
     """Body for ``POST /autopilot``."""
 
     mode: Literal["off", "drive", "leader"]
+
+
+class StartGateRequest(BaseModel):
+    """Body for ``POST /autopilot/start-gate``: ``enabled`` switches the gate (unchanged when omitted); ``go`` releases
+    the episode waiting at it."""
+
+    enabled: bool | None = None
+    go: bool = False
 
 
 class StudioRecordingRequest(BaseModel):
@@ -808,6 +825,13 @@ def _add_automation_routes(
             raise HTTPException(status_code=409, detail=detail)
         commands.put(SetAutopilotCommand(mode=request.mode))
         return {"status": "queued", "mode": request.mode}
+
+    @app.post("/autopilot/start-gate")
+    def start_gate(request: StartGateRequest) -> dict[str, Any]:
+        """r16: an external recorder plans before it records. With the gate on, the demonstrator plans each episode's
+        first attempt, then holds (``/health`` autopilot ``ready``) until a ``go``; then its start pause; then it moves."""
+        commands.put(StartGateCommand(enabled=request.enabled, go=request.go))
+        return {"status": "queued", "enabled": request.enabled, "go": request.go}
 
     @app.post("/studio/recording")
     def studio_recording(request: StudioRecordingRequest) -> dict[str, Any]:

@@ -24,7 +24,13 @@ from defusedxml import ElementTree
 from physicalai.robot.interface import Robot
 from physicalai_mujoco_plugin.compose import fetch_profile, load_scene_model
 from physicalai_mujoco_plugin.profiles import get_profile, validate_profile
-from physicalai_mujoco_plugin.profiles.rebot_b601 import REBOT_B601_GRIPPER_SCALE, REBOT_B601_PROFILE
+from physicalai_mujoco_plugin.profiles.rebot_b601 import (
+    REBOT_B601_FINGER_RANGE,
+    REBOT_B601_GRIPPER_OFFSET,
+    REBOT_B601_GRIPPER_OPEN_TRAVEL,
+    REBOT_B601_GRIPPER_SCALE,
+    REBOT_B601_PROFILE,
+)
 from physicalai_mujoco_plugin.profiles.trossen_wxai import TROSSEN_WXAI_PROFILE
 from physicalai_mujoco_plugin.robot import MuJoCoRobot
 from physicalai_mujoco_plugin.scene_registry import get_scene, list_scenes_naming, supported_arm_counts
@@ -109,11 +115,16 @@ class TestProfiles:
         assert _names(REBOT_B601_PROFILE) == constants.REBOT_B601_RS_JOINT_ORDER
         gripper = REBOT_B601_PROFILE.channels[-1]
         assert (gripper.actuators, gripper.unit, gripper.member_scales) == (("joint_left", "joint_right"), "degrees", (1.0,))
-        # #360's frame: the arm joints are Menagerie's one to one, the gripper -270 (open) to 0 (closed)
-        # across Menagerie's 0..0.05 m finger stroke.
+        # #360's frame: the arm joints are Menagerie's one to one. The gripper (-270 open to 0 closed) follows the
+        # MEASURED real gripper (r16: 85 mm open at -270, the user's measurement; 5.36 mm at 0; real2sim v2, 2026-11-08;
+        # r12 had 70.1 mm / 4.64 mm: scale -2 / 0.0002425, range 2.32-35.06 mm), not #360's URDF ratio of
+        # -270 deg = 0.05 m per finger: the URDF tie is knowingly broken pending an upstream fix of the reBot plugin.
         assert [channel.scale for channel in REBOT_B601_PROFILE.channels[:-1]] == [1.0] * 6
-        assert {channel.offset for channel in REBOT_B601_PROFILE.channels} == {0.0}
-        assert gripper.scale == pytest.approx(-270.0 / 0.05)
+        assert {channel.offset for channel in REBOT_B601_PROFILE.channels[:-1]} == {0.0}
+        assert gripper.scale == pytest.approx(-2.0 / (2.0 * 0.00014749))
+        assert gripper.offset == pytest.approx(REBOT_B601_GRIPPER_OFFSET)
+        # each finger from 0 deg to the real readings' -278 deg overshoot (the command stops at -270)
+        assert gripper.range == pytest.approx((0.0026777, 0.0436799), abs=1e-7)
         # The arm stops where #360's driver clips: the tighter of its limits and Menagerie's ranges.
         ranges = {channel.name: channel.range for channel in REBOT_B601_PROFILE.channels[:-1]}
         assert ranges["shoulder_pan"] == pytest.approx(np.radians((-145.0, 145.0)))
@@ -142,11 +153,13 @@ class TestProfiles:
     def test_rebot_b601_gripper_spans_the_rs_drivers_limits(self) -> None:
         constants = _rs_constants_in_the_lerobot_frame()
         lower, upper = constants.REBOT_B601_RS_JOINT_LIMITS_DEG["gripper"]
-        assert (REBOT_B601_GRIPPER_SCALE * 0.05, 0.0) == pytest.approx((lower, upper))
+        # the measured mapping spans the driver's range over the fingers' measured travel
+        travel = [REBOT_B601_GRIPPER_OFFSET + REBOT_B601_GRIPPER_SCALE * v for v in reversed(REBOT_B601_FINGER_RANGE)]
+        assert travel == pytest.approx([lower, upper], abs=1e-6)
 
     def test_scenes_list_the_twins(self) -> None:
         assert set(list_scenes_naming("trossen_wxai")) == {"single_pick_place", "bucket_sort"}
-        assert set(list_scenes_naming("rebot_b601")) == {"single_pick_place", "bucket_sort"}
+        assert set(list_scenes_naming("rebot_b601")) == {"single_pick_place", "bucket_sort", "bucket_sort_desk", "bucket_sort_desk_v2"}
         for name in ("so101", "trossen_wxai", "rebot_b601"):
             assert supported_arm_counts(get_profile(name)) == (1, 2)
 
@@ -167,9 +180,12 @@ class TestRebotMapping:
             # Same link frames (the zero pose), so only the axis direction can differ.
             assert channel.scale == float(np.sign(model.joint(joint).axis @ urdf_axis)), channel.name
             assert channel.offset == 0.0
-        # The URDF drives the first finger from gripper_drive (radians): finger = multiplier * drive.
+        # The URDF drives the first finger from gripper_drive (radians): finger = multiplier * drive. KNOWINGLY BROKEN
+        # TIE: the profile follows the measured real gripper (85 mm open at -270 deg), not this ratio (100 mm),
+        # pending an upstream fix of the reBot plugin's URDF. This checks the URDF still says what was replaced.
         multiplier = float(joints["gripper_joint1"].find("mimic").get("multiplier"))
-        assert REBOT_B601_GRIPPER_SCALE == pytest.approx(np.degrees(1.0 / multiplier), rel=1e-6)
+        assert np.degrees(1.0 / multiplier) == pytest.approx(-270.0 / 0.05, rel=1e-6)
+        assert REBOT_B601_GRIPPER_SCALE != pytest.approx(np.degrees(1.0 / multiplier), rel=1e-3)
 
     def test_gripper_drives_both_fingers_in_driver_units(self) -> None:
         robot = MuJoCoRobot("rebot_b601", scene="single_pick_place", cameras=[])
@@ -183,7 +199,8 @@ class TestRebotMapping:
             np.testing.assert_allclose(observation.joint_positions, target, atol=1.0)
             data = robot._sim.data  # noqa: SLF001
             for finger in ("joint_left", "joint_right"):
-                assert data.joint(finger).qpos[0] == pytest.approx(0.05, abs=1e-3)  # -270 = fully open
+                # -270 = the fully open command: 42.5 mm per finger (r16; the range runs on to the readings' -278)
+                assert data.joint(finger).qpos[0] == pytest.approx(REBOT_B601_GRIPPER_OPEN_TRAVEL, abs=1e-3)
         finally:
             robot.disconnect()
 
@@ -208,7 +225,7 @@ class TestRebotMapping:
             finger = robot._sim.data.joint("joint_left")  # noqa: SLF001
             gripper, speed = observation.joint_positions[-1], observation.sensor_data["velocities"][-1]
             assert -270.0 < gripper < -0.5
-            assert gripper == pytest.approx(REBOT_B601_GRIPPER_SCALE * finger.qpos[0], rel=1e-5)
+            assert gripper == pytest.approx(REBOT_B601_GRIPPER_OFFSET + REBOT_B601_GRIPPER_SCALE * finger.qpos[0], rel=1e-5)
             assert speed == pytest.approx(REBOT_B601_GRIPPER_SCALE * finger.qvel[0], rel=1e-5)
             assert speed < -0.1
             # The real driver reads the same values from motors at its direction times those degrees.
@@ -300,11 +317,11 @@ def test_rebot_wrist_camera_sits_on_the_d405_mount() -> None:
         link6 = model.body("link6").id
         assert int(model.cam_bodyid[wrist]) == link6  # rolls with the gripper
         assert model.cam_fovy[wrist] == pytest.approx(58.0)  # the D405's vertical field of view
-        # In link6 (+z = roll axis toward the fingers): the front face 104 mm off the axis on the
-        # assumed +x side, 39 mm along it; looking 30 degrees toward the axis, image up away from it.
+        # In link6 (+z = roll axis toward the fingers): the lens 102 mm off the axis on the +x side, 60 mm
+        # along it (triangulated on the real arm); looking 30 degrees toward the axis, image up away from it.
         frame = data.xmat[link6].reshape(3, 3)
         camera = frame.T @ data.cam_xmat[wrist].reshape(3, 3)
-        np.testing.assert_allclose(frame.T @ (data.cam_xpos[wrist] - data.xpos[link6]), [0.10414, 0, 0.03915], atol=1e-9)
+        np.testing.assert_allclose(frame.T @ (data.cam_xpos[wrist] - data.xpos[link6]), [0.1017, 0.0031, 0.0602], atol=1e-9)
         np.testing.assert_allclose(-camera[:, 2], [-0.5, 0, np.sqrt(3) / 2], atol=1e-9)  # forward
         np.testing.assert_allclose(camera[:, 1], [np.sqrt(3) / 2, 0, 0.5], atol=1e-9)  # image up
         np.testing.assert_allclose(camera[:, 0], [0, 1, 0], atol=1e-9)  # image right

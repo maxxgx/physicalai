@@ -229,6 +229,8 @@ class TestDemonstrator:
 
         close, missing = fake(arm=0.029), fake(pos_error=0.005)
         assert bd._severity(close) < bd._severity(missing)
+        # r16: the stand-in plans below come from an iterator; the screen-first second pass would draw new ones
+        monkeypatch.setattr(bd, "SCREEN_FIRST", False)
         snapshot, instruction = bd.SceneSnapshot.take(data), scene._sim.on_reset.instruction
         # Within one arm's variants ...
         plans = iter([close, missing, *(fake(pos_error=0.5) for _ in range(20))])

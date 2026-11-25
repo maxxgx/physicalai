@@ -18,8 +18,11 @@ from physicalai_mujoco_plugin._urdf import get_urdf_path
 from physicalai_mujoco_plugin.bucket_sort import BUCKET_JOINTS as BUCKET_SORT_BUCKET_JOINTS
 from physicalai_mujoco_plugin.bucket_sort import DEFAULT_LAYOUT, BucketSortTask, TaskLayout
 from physicalai_mujoco_plugin.bucket_sort import OBJECTS as BUCKET_SORT_OBJECTS
+from physicalai_mujoco_plugin.bucket_sort_objects import body_names as pool_body_names
 from physicalai_mujoco_plugin.bucket_sort_arms import (
     BUCKET_SORT_ARMS,
+    REBOT_DESK_LAYOUT,
+    REBOT_DESK_V2_LAYOUT,
     SIX_JOINT_LAYOUT,
     WXAI_PAIR_LAYOUT,
     WXAI_PAIR_SEPARATION,
@@ -776,6 +779,49 @@ _SCENES: dict[str, SceneConfig] = {
     ),
 }
 
+_SCENES["bucket_sort_desk"] = replace(
+    _SCENES["bucket_sort"],
+    scene_id="bucket_sort_desk",
+    display_name="Bucket Sort (real desk)",
+    description="The real reBot B601 desk (real2sim): four buckets (black, green, red, blue) in the measured row",
+    scene_xml_relpath="scenes/bucket_sort_desk/scene.xml",
+    free_joints=(
+        *(f"{name}:joint" for name in BUCKET_SORT_OBJECTS),
+        *(f"bucket_{color}:joint" for color in ("black", "green", "red", "blue")),
+    ),
+    robots=("rebot_b601",),
+    profile_arm_counts=(),
+    two_arm_separations=(),
+    profile_task_layouts=(("rebot_b601", 1, REBOT_DESK_LAYOUT),),
+    profile_home_qpos=(("rebot_b601", bucket_sort_home("rebot_b601")),),
+    two_arm_home_qpos=(),
+    # The overview camera stands where the real one does (scene.xml); no per-profile rig and no front style.
+    profile_overview_rigs=(),
+    front_view=None,
+    profile_front_overrides=(),
+    two_arm_overview_rigs=(),
+)
+"""bucket_sort on the real reBot desk, measured from a phone scan: the desk, the base plate, the bucket row and the
+overview camera's pole (``urdf/scenes/bucket_sort_desk/scene.xml``)."""
+
+_SCENES["bucket_sort_desk_v2"] = replace(
+    _SCENES["bucket_sort_desk"],
+    scene_id="bucket_sort_desk_v2",
+    display_name="Bucket Sort (real desk, v2)",
+    description=(
+        "The real reBot B601 desk in its second setup (real2sim): four buckets, a mixed pile of objects, "
+        "put any object in any bucket"
+    ),
+    scene_xml_relpath="scenes/bucket_sort_desk_v2/scene.xml",
+    free_joints=(
+        *(f"{name}:joint" for name in (*BUCKET_SORT_OBJECTS, *pool_body_names())),
+        *(f"bucket_{color}:joint" for color in ("black", "green", "red", "blue")),
+    ),
+    profile_task_layouts=(("rebot_b601", 1, REBOT_DESK_V2_LAYOUT),),
+)
+"""bucket_sort on the reBot desk's v2 setup: the v1 desk geometry until the v2 calibration replaces it, plus the
+mixed object pool (:mod:`.bucket_sort_objects`)."""
+
 _FREEJOINT_SPAWN_SCENES = ("single_pick_place",)
 """Scenes whose reset respawns their free objects in the spawn arc laid out for the robot."""
 
@@ -783,6 +829,12 @@ _RESET_FUNCTIONS: dict[str, Callable[[SceneConfig, RobotProfile, int, tuple[int,
     "yahtzee": lambda _scene, _profile, _arms, roots: _yahtzee_reset(roots),
     "conveyor_sort": lambda scene, profile, arms, _roots: _conveyor_sort_reset(scene.home_pose(arms, profile)),
     "bucket_sort": lambda scene, profile, arms, roots: _bucket_sort_reset(
+        scene.home_pose(arms, profile), roots, scene.task_layout(profile, arms)
+    ),
+    "bucket_sort_desk": lambda scene, profile, arms, roots: _bucket_sort_reset(
+        scene.home_pose(arms, profile), roots, scene.task_layout(profile, arms)
+    ),
+    "bucket_sort_desk_v2": lambda scene, profile, arms, roots: _bucket_sort_reset(
         scene.home_pose(arms, profile), roots, scene.task_layout(profile, arms)
     ),
 }

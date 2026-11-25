@@ -34,7 +34,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from math import pi, radians
 
-from physicalai_mujoco_plugin.bucket_sort import TaskLayout
+from physicalai_mujoco_plugin.bucket_sort import Pose2D, TaskLayout
+from physicalai_mujoco_plugin.profiles.rebot_b601 import REBOT_B601_GRIPPER_OPEN_TRAVEL
 
 FRANKA_GRIP_OPEN = 0.08
 """The Franka Hand's full opening, in metres."""
@@ -252,7 +253,7 @@ REBOT_ARM = BucketSortArm(
     gripper="joint_left",
     gripper_followers=("joint_right",),
     grip_per_width=0.5,
-    gripper_open_ctrl=0.05,
+    gripper_open_ctrl=REBOT_B601_GRIPPER_OPEN_TRAVEL,   # -270 deg, the real open command (r16)
     links=("link4", "link5"),
     arm_links=tuple(f"link{i}" for i in range(1, 7)),
     home=tuple(radians(v) for v in (0.0, -50.0, -60.7, 75.7, 0.0, 0.0)),
@@ -264,7 +265,7 @@ REBOT_ARM = BucketSortArm(
     fingers=("joint_left", "joint_right"),
     hand_bodies=("link6", "gripper_end", "gripper_left", "gripper_right"),
     finger_bodies=("gripper_left", "gripper_right"),
-    grip_open=0.10,
+    grip_open=2.0 * REBOT_B601_GRIPPER_OPEN_TRAVEL,
     min_tcp_z=0.006,
     squeeze=0.006,
     wrist=5,
@@ -274,7 +275,8 @@ REBOT_ARM = BucketSortArm(
     joint_margin=radians(3.0),
 )
 """The reBot B601: the profile's tool point 0.163 m out along ``link6``, the fingers along its z,
-closing along its y, each moving half the opening (0 to 0.05 m). Its wrist turns only 90 deg either
+closing along its y, each moving half the opening (2.3 to 35.1 mm per finger, as the real gripper measured; the
+model's slide reaches 0.05 m, the profile limits it). Its wrist turns only 90 deg either
 way, so the joints keep 3 deg inside their limits instead of 7."""
 
 BUCKET_SORT_ARMS: dict[str, tuple[FrankaArm, ...]] = {
@@ -302,6 +304,80 @@ SIX_JOINT_LAYOUT = TaskLayout(
 them nearly straight down, and the buckets 0.28 to 0.60 m (the release points), where the hand
 reaches over their rims leaning outward. The buckets' open ends face the base. Full size, the
 scene's table; the hands' footprints are the grippers' (camera mount included)."""
+REBOT_DESK_ROW = (
+    ("black", Pose2D(0.5264, -0.2171, 1.1750)),
+    ("green", Pose2D(0.5639, -0.0618, 1.4027)),
+    ("red", Pose2D(0.5651, 0.0967, 1.6697)),
+    ("blue", Pose2D(0.5345, 0.2656, 1.8072)),
+)
+"""The real reBot desk's buckets, right to left as seen from behind the robot (``bucket_sort_desk``): centres and
+headings measured from a phone scan of the desk (real2sim calibration), the open ends facing the base."""
+REBOT_DESK_LAYOUT = replace(
+    SIX_JOINT_LAYOUT,
+    row=REBOT_DESK_ROW,
+    row_jitter=(0.015, 0.015, radians(6.0)),
+    bucket_reach=(0.28, 0.68),
+    bucket_gap=0.0,
+    table_x=(-0.07, 0.72),
+    table_y=(-0.80, 0.75),
+    fill=(0.0, 1.0),
+    reach=(0.29, 0.42),
+)
+"""The reBot on the real desk: the measured bucket row, each bucket moved up to 1.5 cm and turned up to 6 degrees
+at each reset, the objects where :data:`SIX_JOINT_LAYOUT` puts them but at least 0.29 m from the base (the 1 cm
+base plate puts nearer grasps beyond the hand's 15 degree lean), and each bucket's contents from empty to full. The real buckets stand nearly touching and
+up to 0.62 m from the base, so the gap and the bucket reach are those of the measured row."""
+REBOT_DESK_V2_ROW = (
+    ("green", Pose2D(0.4635, -0.3035, 0.9311)),
+    ("red", Pose2D(0.5718, -0.0931, 1.7029)),
+    ("black", Pose2D(0.5306, 0.0838, 2.0214)),
+    ("blue", Pose2D(0.4739, 0.3112, 2.2549)),
+)
+"""The v2 desk's buckets, right to left as seen from behind the robot (``bucket_sort_desk_v2``): centres and headings
+measured from a phone scan (real2sim v2 calibration: rims in a straight-down splat render); the open ends face the
+base."""
+REBOT_DESK_V2_DEFAULT = replace(
+    REBOT_DESK_LAYOUT,
+    row=REBOT_DESK_V2_ROW,
+    table_x=(-0.074, 0.720),
+    table_y=(-0.775, 0.775),
+    row_jitter=(0.0, 0.0, 0.0),
+    fill=None,
+    active_objects=(3, 8),
+    pile_probability=0.3,
+    scatter_finger_clearance=False,
+    stack_probability=0.5,
+    scatter_kind_counts=(("resistor", 0, 3), ("cpu", 0, 2), ("battery", 0, 1)),
+    upright=(("resistor", 0.22),),
+    sequence_probability=0.5,
+    kind_counts=(("resistor", 1, 4), ("cpu", 1, 3), ("battery", 0, 2)),
+    distractors=(0, 0),
+    real_pairs=(("resistor", "red"), ("cpu", "blue"), ("battery", "black"), ("resistor", "green")),
+    real_pair_probability=0.5,
+    novel_target_fraction=0.0,
+)
+"""The reBot on the v2 desk (``bucket_sort_desk_v2``) as it really is: the measured bucket row (set by the scene from
+the calibration; :func:`set_desk_v2_row`), real colours, contents, table and light. The table holds only the real
+objects, as on the real desk: seven tables in ten are scattered like the real ones (one to five objects: up to three
+resistors, two CPUs, one battery), three in ten a pile (one to four resistors, one to three CPUs, up to two batteries,
+half the objects lying on others); about one resistor in five stands on its end (as counted in the allowed episodes). The instruction names a kind and a bucket (the real task pairs
+half the time) and every object of that kind is sorted in the episode; after a success, half the time the next
+instruction names another kind from the same table. No generic shapes (``distractors`` 0) and no novel objects."""
+REBOT_DESK_V2_RAND = replace(
+    REBOT_DESK_V2_DEFAULT,
+    shuffle_row=True,
+    row_jitter=(0.03, 0.025, radians(12.0)),
+    real_look_probability=0.0,
+    real_bucket_probability=0.25,
+    exposure_range=(0.8, 1.2),
+)
+"""Every knob drawn: the row's places dealt to the colours at random and each bucket moved up to 3 cm across and
+2.5 cm along the row and turned up to 12 degrees; bucket colours recoloured three times in four; table colour and
+pattern, light, camera jitter, exposure, white balance, noise and blur (bucket_sort.randomize_look)."""
+REBOT_DESK_V2_LAYOUT = replace(REBOT_DESK_V2_RAND, real_look_probability=0.3, real_bucket_probability=0.4, stratified_retry=True)
+"""The recording mix: three episodes in ten show the real look, and two in five the real bucket colours; after a failed
+episode the next layout keeps its stratum (arrangement, kind, number of targets), so the recorded successes keep the
+specified mix of strata."""
 WXAI_PAIR_SEPARATION = 0.44
 """Two WidowX AI stand this far apart at the table edge, side by side."""
 WXAI_PAIR_TURN = radians(30.0)
@@ -365,6 +441,12 @@ __all__ = [
     "FRANKA_GRIP_OPEN",
     "PANDA_ARM",
     "REBOT_ARM",
+    "REBOT_DESK_LAYOUT",
+    "REBOT_DESK_ROW",
+    "REBOT_DESK_V2_DEFAULT",
+    "REBOT_DESK_V2_ROW",
+    "REBOT_DESK_V2_LAYOUT",
+    "REBOT_DESK_V2_RAND",
     "SIX_JOINT_LAYOUT",
     "WXAI_ARM",
     "WXAI_PAIR_LAYOUT",

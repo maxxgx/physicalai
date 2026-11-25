@@ -304,6 +304,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     start.add_argument("--status-json", action="store_true", default=False, help=_STATUS_JSON_HELP)
     start.add_argument(
+        "--appearance",
+        default=None,
+        metavar="KIT_JSON",
+        help="A real2sim kit (real2sim.json): camera streams are composited over its splat instead of MuJoCo's render",
+    )
+    start.add_argument(
         "--exit-with-parent",
         action="store_true",
         default=False,
@@ -613,6 +619,7 @@ def _run_start(args: argparse.Namespace, status: _StatusWriter) -> None:  # noqa
         exit_with_pid=os.getpid() if args.exit_with_parent else None,
         grip_force_n=args.grip_force,
         http_fallback_port=http_fallback_port,
+        appearance=args.appearance,
     )
 
     shared = SharedRobot.from_config(

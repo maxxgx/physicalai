@@ -48,7 +48,7 @@ class TestMuJoCoSO101Payload:
     def test_payload_stored_before_http_url_still_validates(self) -> None:
         stored = {"name": "my-sim", "allow_remote": True, "connect_timeout": 5.0}
         payload = MuJoCoSO101Payload.model_validate(stored)
-        assert payload.model_dump() == {**stored, "http_url": "http://127.0.0.1:8080"}
+        assert payload.model_dump() == {**stored, "http_url": "http://127.0.0.1:8080", "appearance": ""}
 
     def test_custom_payload(self) -> None:
         payload = MuJoCoSO101Payload(name="my-sim", allow_remote=True, connect_timeout=5.0)
@@ -631,7 +631,7 @@ class TestSimulationLaunch:
             "MuJoCo_SO101_Bimanual_Follower": so101,
             "MuJoCo_WidowXAI_Follower": ["single_pick_place", "bucket_sort"],
             "MuJoCo_WidowXAI_Bimanual_Follower": ["single_pick_place", "bucket_sort"],
-            "MuJoCo_reBotB601_Follower": ["single_pick_place", "bucket_sort"],
+            "MuJoCo_reBotB601_Follower": ["single_pick_place", "bucket_sort", "bucket_sort_desk", "bucket_sort_desk_v2"],
             **dict.fromkeys(
                 ["MuJoCo_FrankaResearch3_Follower", "MuJoCo_FrankaEmikaPanda_Follower", "MuJoCo_FrankaDuo_Follower"],
                 ["single_pick_place", "bucket_sort"],
@@ -691,6 +691,20 @@ class TestSimulationLaunch:
         # The payload's port when it is free, so cameras and exports keep their address.
         assert (args.http_port, args.http_port_fallback) == (8765, True)
         assert args.viewer_theme == "studio"
+
+    def test_appearance_kit_reaches_both_start_commands(self) -> None:
+        from physicalai_mujoco_plugin import __main__ as cli  # noqa: PLC0415
+
+        entry = {entry.type: entry for entry in list_catalog_entries()}["MuJoCo_reBotB601_Follower"]
+        launch = entry.simulation_launch()
+        assert launch is not None
+        kit = "/data/bucket-v2/real2sim.json"
+        payload = _payload_model(entry)(http_url="http://127.0.0.1:8931", appearance=kit)
+        for argv in (launch.argv(launch.default_scene, payload, None), launch.standalone_argv(launch.default_scene, payload)):
+            assert argv[argv.index("--appearance") + 1] == kit
+        assert cli._build_parser().parse_args(launch.argv(launch.default_scene, payload, None)[3:]).appearance == kit  # noqa: SLF001
+        plain = _payload_model(entry)(http_url="http://127.0.0.1:8931")
+        assert "--appearance" not in launch.argv(launch.default_scene, plain, None)
 
     @pytest.mark.parametrize("http_url", ["http://127.0.0.1:notaport", "http://127.0.0.1:0", "127.0.0.1:8080"])
     def test_argv_takes_a_free_port_without_a_usable_payload_port(self, http_url: str) -> None:

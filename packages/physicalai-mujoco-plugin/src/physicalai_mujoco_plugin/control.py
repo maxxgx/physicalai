@@ -250,6 +250,8 @@ class OperatorControls:
             self._go_home()
         elif isinstance(command, cmd.SetAutopilotCommand):
             self._automation.set_autopilot(command.mode)  # type: ignore[union-attr]
+        elif isinstance(command, cmd.StartGateCommand):
+            self._automation.set_start_gate(enabled=command.enabled, go=command.go)  # type: ignore[union-attr]
         elif isinstance(command, cmd.SetStudioRecordingCommand):
             self._automation.set_studio_recording(command.options)  # type: ignore[union-attr]
         elif isinstance(command, cmd.SetObjectPoseCommand) and sim is not None:

@@ -227,6 +227,11 @@ class MuJoCoRobotPayload(BaseModel):
         description="Address of the simulation's HTTP server (cameras and the 3D viewer at /viewer)",
         json_schema_extra=robot_field_ui({"advanced_configuration": True}),
     )
+    appearance: str = Field(  # type: ignore[call-overload]
+        default="",
+        description="A real2sim kit file (real2sim.json): the cameras show the reconstructed scene (start --appearance)",
+        json_schema_extra=robot_field_ui({"advanced_configuration": True}),
+    )
 
 
 class MuJoCoSO101Payload(MuJoCoRobotPayload):
@@ -365,6 +370,8 @@ class CatalogEntry:
         ]
         if seed is not None:
             argv += ["--seed", str(seed)]
+        if validated.appearance:
+            argv += ["--appearance", validated.appearance]
         return argv
 
     def standalone_argv(self, *, scene: str, payload: MuJoCoRobotPayload, seed: int | None) -> list[str]:
@@ -411,6 +418,8 @@ class CatalogEntry:
             argv.append("--allow-remote")
         if seed is not None:
             argv += ["--seed", str(seed)]
+        if payload.appearance:
+            argv += ["--appearance", payload.appearance]
         return argv
 
     def payload_owner_name(self, payload: MuJoCoRobotPayload) -> str:

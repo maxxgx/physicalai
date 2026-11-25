@@ -43,6 +43,7 @@ class PoseSnapshot:
         self._qpos = np.zeros(int(model.nq))
         self._mocap_pos = np.zeros((int(model.nmocap), 3))
         self._mocap_quat = np.zeros((int(model.nmocap), 4))
+        self._time = 0.0
         self._seq = 0
 
     @property
@@ -56,6 +57,7 @@ class PoseSnapshot:
             np.copyto(self._qpos, data.qpos)
             np.copyto(self._mocap_pos, data.mocap_pos)
             np.copyto(self._mocap_quat, data.mocap_quat)
+            self._time = float(data.time)  # the sim time: what renders over time (image noise) follows it
             self._seq += 1
 
     def load_into(self, data: object) -> int:
@@ -68,6 +70,7 @@ class PoseSnapshot:
             np.copyto(data.qpos, self._qpos)
             np.copyto(data.mocap_pos, self._mocap_pos)
             np.copyto(data.mocap_quat, self._mocap_quat)
+            data.time = self._time
             return self._seq
 
 

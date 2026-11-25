@@ -1,0 +1,390 @@
+<?xml version="1.0"?>
+<!--
+  bucket_sort_desk: the real reBot B601 desk (real2sim) with four buckets (black, green, red, blue) and three objects
+  (resistor, 9 V battery, CPU). Each episode names one object and one bucket
+  ("put the CPU in the red bucket"); bucket_sort.py randomizes the layout and checks success.
+
+  Layout (world frame, metres; the robot base sits at the origin facing +x):
+    - Table top at z = 0, 1.8 m wide (y, from -0.9 to 0.9) and 1.0 m deep (x, from -0.17 to 0.83); the floor is
+      0.75 m below it.
+    - Buckets stand 0.50 to 0.72 m in front of the base and up to 0.40 m to either side
+      (bucket_sort.BUCKET_X, BUCKET_Y). The buckets are free bodies (bucket_<colour>:joint) that
+      can be pushed or moved; each reset lays them out anew in a random colour order.
+    - Objects spawn between the base and the buckets (bucket_sort.OBJECT_X, OBJECT_Y), clear of
+      the buckets and of each other (bucket_sort.sample_layout).
+  The buckets lie on their long side with the opening up, the long axis along x and the open
+  end (above the low lip) facing the robot, turned up to 25 degrees either way at each reset.
+  The poses written below are only the model's defaults, before the first reset.
+  Meshes are MuJoCo's binary MSH files from scripts/build_bucket_sort_meshes.py; the *_hull meshes
+  hold vertices only, and MuJoCo builds their convex hulls. The bucket's collision is primitives
+  here (bucket_sort.BUCKET_INTERIOR uses the same numbers).
+-->
+<mujoco model="bucket_sort">
+  <compiler angle="radian" assetdir="../bucket_sort/assets" autolimits="true"/>
+  <!-- ls_iterations 50: under the Franka Hand's 70 N squeeze, 20 line-search steps can leave the
+       contact solve unfinished, and the held object is thrown out at metres per second. -->
+  <option integrator="implicitfast" timestep="0.002" cone="elliptic" iterations="10" ls_iterations="50" impratio="10"/>
+  <include file="../scene_common.xml"/>
+
+  <default>
+    <default class="visual">
+      <geom contype="0" conaffinity="0" group="2" type="mesh" density="0"/>
+    </default>
+    <!-- Bucket walls: 350 kg/m^3 over the boxes gives a 0.2 kg bucket, about a printed one. Their
+         contacts are stiff (solref 4 ms, and solmix makes it win over the other geom's): with
+         MuJoCo's default 20 ms an object dropped from 0.26 m sinks about 19 mm and passes through
+         the 6 mm bottom; with this, about 3 mm. -->
+    <default class="bucket_collision">
+      <geom type="box" group="3" rgba="0.5 0.5 0.5 0" condim="3" friction="0.6 0.005 0.0001" density="350" solref="0.004 1" solmix="100"/>
+    </default>
+    <!-- Grippable objects: friction 0.9 against the Franka Hand's pads, torsional friction so a
+         two-finger grasp does not spin them. -->
+    <default class="object_collision">
+      <geom type="mesh" group="3" rgba="0.5 0.5 0.5 0" condim="4" friction="0.9 0.01 0.0001"/>
+    </default>
+  </default>
+
+  <asset>
+    <mesh name="bucket" file="bucket.msh" inertia="shell"/>
+    <mesh name="battery_metal" file="battery_metal.msh" inertia="shell"/>
+    <mesh name="battery_label" file="battery_label.msh" inertia="shell"/>
+    <mesh name="battery_band" file="battery_band.msh" inertia="shell"/>
+    <mesh name="battery_hull" file="battery_hull.msh"/>
+    <mesh name="cpu_body" file="cpu_body.msh" inertia="shell"/>
+    <mesh name="cpu_marking" file="cpu_marking.msh" inertia="shell"/>
+    <mesh name="cpu_legs" file="cpu_legs.msh" inertia="shell"/>
+    <mesh name="cpu_hull" file="cpu_hull.msh"/>
+    <mesh name="resistor_body" file="resistor_body.msh" inertia="shell"/>
+    <mesh name="resistor_band_brown" file="resistor_band_brown.msh" inertia="shell"/>
+    <mesh name="resistor_band_red" file="resistor_band_red.msh" inertia="shell"/>
+    <mesh name="resistor_band_yellow" file="resistor_band_yellow.msh" inertia="shell"/>
+    <mesh name="resistor_hull" file="resistor_hull.msh"/>
+
+    <texture name="table_top" type="2d" builtin="flat" rgb1="0.56 0.43 0.31" rgb2="0.52 0.40 0.29" mark="random" random="0.08" markrgb="0.50 0.38 0.27" width="256" height="256"/>
+    <material name="table_top" rgba="0.90 0.90 0.88 1" specular="0.1"/>
+    <material name="plate" rgba="0.09 0.09 0.10 1" specular="0.3"/>
+    <material name="pole" rgba="0.08 0.08 0.08 1" specular="0.3"/>
+    <material name="table_leg" rgba="0.30 0.31 0.33 1" specular="0.4"/>
+
+    <material name="bucket_black" rgba="0.10 0.10 0.11 1" specular="0.3" shininess="0.4"/>
+    <material name="bucket_blue" rgba="0.12 0.32 0.85 1" specular="0.3" shininess="0.4"/>
+    <material name="bucket_green" rgba="0.10 0.55 0.27 1" specular="0.3" shininess="0.4"/>
+    <material name="bucket_red" rgba="0.82 0.10 0.08 1" specular="0.3" shininess="0.4"/>
+
+    <!-- The objects' colours are the diffuse colours of their source materials. -->
+    <material name="battery_metal" rgba="0.647 0.647 0.647 1" specular="0.6" shininess="0.6"/>
+    <material name="battery_label" rgba="0.263 0.282 0.302 1"/>
+    <material name="battery_band" rgba="1.000 0.757 0.055 1"/>
+    <material name="cpu_body" rgba="0.263 0.282 0.302 1"/>
+    <material name="cpu_marking" rgba="1.000 1.000 1.000 1"/>
+    <material name="cpu_legs" rgba="0.647 0.647 0.647 1" specular="0.6" shininess="0.6"/>
+    <!-- The resistor is coloured after a reference photo of a carbon-film resistor (the source
+         has one plain material): a matte tan body with brown, red, brown and yellow bands. -->
+    <material name="resistor_body" rgba="0.808 0.710 0.549 1" specular="0.05" shininess="0.1"/>
+    <material name="band_brown" rgba="0.506 0.247 0.008 1" specular="0.05" shininess="0.1"/>
+    <material name="band_red" rgba="0.910 0.008 0.008 1" specular="0.05" shininess="0.1"/>
+    <material name="band_yellow" rgba="0.824 0.745 0.157 1" specular="0.25" shininess="0.4"/>
+  </asset>
+
+    <worldbody>
+    <light pos="0.3 0.6 2.6" dir="-0.1 -0.2 -1" directional="false" cutoff="60" exponent="1" diffuse="0.55 0.55 0.55"/>
+    <light pos="0 0 3.5" dir="0 0 -1" directional="true" diffuse="0.45 0.45 0.45" castshadow="false"/>
+    <geom name="floor" type="plane" size="0 0 0.01" pos="0 0 -0.7500" material="floor" condim="3" friction="0.5 0.005 0.0001"/>
+    <!-- The white desk as measured (calibration.json): 1.550 x 0.788 m, the robot on a 10.6 mm base plate. -->
+    <geom name="table_top" type="box" pos="0.3232 -0.0254 -0.0125" euler="0 0 -1.5947" size="0.7749 0.3942 0.0125" material="table_top" condim="3" friction="0.6 0.005 0.0001"/>
+    <geom name="base_plate" type="box" pos="0 0 0.0053" size="0.07 0.10 0.0053" material="plate"/>
+    <body name="bucket_black" pos="0.5264 -0.2171 0.0000" quat="0.832315 0 0 0.554303">
+      <freejoint name="bucket_black:joint"/>
+      <geom class="visual" mesh="bucket" material="bucket_black"/>
+      <geom class="bucket_collision" name="bucket_black_bottom" pos="0 -0.0125 0.003" size="0.075 0.08875 0.003"/>
+      <geom class="bucket_collision" name="bucket_black_wall_left" pos="0.072 0 0.063" size="0.003 0.10125 0.057"/>
+      <geom class="bucket_collision" name="bucket_black_wall_right" pos="-0.072 0 0.063" size="0.003 0.10125 0.057"/>
+      <geom class="bucket_collision" name="bucket_black_wall_end" pos="0 -0.09825 0.063" size="0.069 0.003 0.057"/>
+      <geom class="bucket_collision" name="bucket_black_lip" pos="0 0.0867 0.0195" euler="0.8789 0 0" size="0.069 0.0227 0.003"/>
+      <geom class="object_collision" name="bucket_black_item0" mesh="resistor_hull" pos="0.0328 0.0056 0.0207" quat="0.99975 -0.00099 0.00804 -0.02069" mass="0.04"/>
+      <geom class="visual" name="bucket_black_item0_resistor_body" mesh="resistor_body" material="resistor_body" pos="0.0328 0.0056 0.0207" quat="0.99975 -0.00099 0.00804 -0.02069"/>
+      <geom class="visual" name="bucket_black_item0_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="0.0328 0.0056 0.0207" quat="0.99975 -0.00099 0.00804 -0.02069"/>
+      <geom class="visual" name="bucket_black_item0_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="0.0328 0.0056 0.0207" quat="0.99975 -0.00099 0.00804 -0.02069"/>
+      <geom class="visual" name="bucket_black_item0_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="0.0328 0.0056 0.0207" quat="0.99975 -0.00099 0.00804 -0.02069"/>
+      <geom class="object_collision" name="bucket_black_item1" mesh="resistor_hull" pos="-0.0426 -0.0092 0.0209" quat="0.99898 0.00112 -0.02558 -0.03712" mass="0.04"/>
+      <geom class="visual" name="bucket_black_item1_resistor_body" mesh="resistor_body" material="resistor_body" pos="-0.0426 -0.0092 0.0209" quat="0.99898 0.00112 -0.02558 -0.03712"/>
+      <geom class="visual" name="bucket_black_item1_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="-0.0426 -0.0092 0.0209" quat="0.99898 0.00112 -0.02558 -0.03712"/>
+      <geom class="visual" name="bucket_black_item1_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="-0.0426 -0.0092 0.0209" quat="0.99898 0.00112 -0.02558 -0.03712"/>
+      <geom class="visual" name="bucket_black_item1_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="-0.0426 -0.0092 0.0209" quat="0.99898 0.00112 -0.02558 -0.03712"/>
+      <geom class="object_collision" name="bucket_black_item2" mesh="resistor_hull" pos="-0.0053 -0.0038 0.0227" quat="0.94712 0.00154 -0.32074 0.00894" mass="0.04"/>
+      <geom class="visual" name="bucket_black_item2_resistor_body" mesh="resistor_body" material="resistor_body" pos="-0.0053 -0.0038 0.0227" quat="0.94712 0.00154 -0.32074 0.00894"/>
+      <geom class="visual" name="bucket_black_item2_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="-0.0053 -0.0038 0.0227" quat="0.94712 0.00154 -0.32074 0.00894"/>
+      <geom class="visual" name="bucket_black_item2_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="-0.0053 -0.0038 0.0227" quat="0.94712 0.00154 -0.32074 0.00894"/>
+      <geom class="visual" name="bucket_black_item2_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="-0.0053 -0.0038 0.0227" quat="0.94712 0.00154 -0.32074 0.00894"/>
+      <geom class="object_collision" name="bucket_black_item3" mesh="resistor_hull" pos="0.0013 -0.0568 0.0386" quat="0.90902 0.40593 0.06399 -0.06936" mass="0.04"/>
+      <geom class="visual" name="bucket_black_item3_resistor_body" mesh="resistor_body" material="resistor_body" pos="0.0013 -0.0568 0.0386" quat="0.90902 0.40593 0.06399 -0.06936"/>
+      <geom class="visual" name="bucket_black_item3_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="0.0013 -0.0568 0.0386" quat="0.90902 0.40593 0.06399 -0.06936"/>
+      <geom class="visual" name="bucket_black_item3_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="0.0013 -0.0568 0.0386" quat="0.90902 0.40593 0.06399 -0.06936"/>
+      <geom class="visual" name="bucket_black_item3_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="0.0013 -0.0568 0.0386" quat="0.90902 0.40593 0.06399 -0.06936"/>
+      <geom class="object_collision" name="bucket_black_item4" mesh="resistor_hull" pos="0.0361 -0.0432 0.0406" quat="0.71965 0.64201 0.24895 -0.08914" mass="0.04"/>
+      <geom class="visual" name="bucket_black_item4_resistor_body" mesh="resistor_body" material="resistor_body" pos="0.0361 -0.0432 0.0406" quat="0.71965 0.64201 0.24895 -0.08914"/>
+      <geom class="visual" name="bucket_black_item4_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="0.0361 -0.0432 0.0406" quat="0.71965 0.64201 0.24895 -0.08914"/>
+      <geom class="visual" name="bucket_black_item4_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="0.0361 -0.0432 0.0406" quat="0.71965 0.64201 0.24895 -0.08914"/>
+      <geom class="visual" name="bucket_black_item4_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="0.0361 -0.0432 0.0406" quat="0.71965 0.64201 0.24895 -0.08914"/>
+      <geom class="object_collision" name="bucket_black_item5" mesh="resistor_hull" pos="-0.0510 0.0367 0.0407" quat="0.00120 -0.01679 -0.85442 0.51931" mass="0.04"/>
+      <geom class="visual" name="bucket_black_item5_resistor_body" mesh="resistor_body" material="resistor_body" pos="-0.0510 0.0367 0.0407" quat="0.00120 -0.01679 -0.85442 0.51931"/>
+      <geom class="visual" name="bucket_black_item5_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="-0.0510 0.0367 0.0407" quat="0.00120 -0.01679 -0.85442 0.51931"/>
+      <geom class="visual" name="bucket_black_item5_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="-0.0510 0.0367 0.0407" quat="0.00120 -0.01679 -0.85442 0.51931"/>
+      <geom class="visual" name="bucket_black_item5_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="-0.0510 0.0367 0.0407" quat="0.00120 -0.01679 -0.85442 0.51931"/>
+      <geom class="object_collision" name="bucket_black_item6" mesh="resistor_hull" pos="-0.0175 0.0521 0.0444" quat="0.96795 -0.09907 0.22491 -0.05171" mass="0.04"/>
+      <geom class="visual" name="bucket_black_item6_resistor_body" mesh="resistor_body" material="resistor_body" pos="-0.0175 0.0521 0.0444" quat="0.96795 -0.09907 0.22491 -0.05171"/>
+      <geom class="visual" name="bucket_black_item6_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="-0.0175 0.0521 0.0444" quat="0.96795 -0.09907 0.22491 -0.05171"/>
+      <geom class="visual" name="bucket_black_item6_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="-0.0175 0.0521 0.0444" quat="0.96795 -0.09907 0.22491 -0.05171"/>
+      <geom class="visual" name="bucket_black_item6_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="-0.0175 0.0521 0.0444" quat="0.96795 -0.09907 0.22491 -0.05171"/>
+      <geom class="object_collision" name="bucket_black_item7" mesh="resistor_hull" pos="0.0147 0.0137 0.0464" quat="0.94944 -0.01386 -0.31363 -0.00301" mass="0.04"/>
+      <geom class="visual" name="bucket_black_item7_resistor_body" mesh="resistor_body" material="resistor_body" pos="0.0147 0.0137 0.0464" quat="0.94944 -0.01386 -0.31363 -0.00301"/>
+      <geom class="visual" name="bucket_black_item7_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="0.0147 0.0137 0.0464" quat="0.94944 -0.01386 -0.31363 -0.00301"/>
+      <geom class="visual" name="bucket_black_item7_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="0.0147 0.0137 0.0464" quat="0.94944 -0.01386 -0.31363 -0.00301"/>
+      <geom class="visual" name="bucket_black_item7_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="0.0147 0.0137 0.0464" quat="0.94944 -0.01386 -0.31363 -0.00301"/>
+      <geom class="object_collision" name="bucket_black_item8" mesh="resistor_hull" pos="-0.0235 -0.0188 0.0488" quat="0.97335 0.05287 0.20569 -0.08653" mass="0.04"/>
+      <geom class="visual" name="bucket_black_item8_resistor_body" mesh="resistor_body" material="resistor_body" pos="-0.0235 -0.0188 0.0488" quat="0.97335 0.05287 0.20569 -0.08653"/>
+      <geom class="visual" name="bucket_black_item8_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="-0.0235 -0.0188 0.0488" quat="0.97335 0.05287 0.20569 -0.08653"/>
+      <geom class="visual" name="bucket_black_item8_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="-0.0235 -0.0188 0.0488" quat="0.97335 0.05287 0.20569 -0.08653"/>
+      <geom class="visual" name="bucket_black_item8_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="-0.0235 -0.0188 0.0488" quat="0.97335 0.05287 0.20569 -0.08653"/>
+      <geom class="object_collision" name="bucket_black_item9" mesh="resistor_hull" pos="-0.0320 -0.0650 0.0662" quat="0.86326 0.43071 -0.22973 0.12841" mass="0.04"/>
+      <geom class="visual" name="bucket_black_item9_resistor_body" mesh="resistor_body" material="resistor_body" pos="-0.0320 -0.0650 0.0662" quat="0.86326 0.43071 -0.22973 0.12841"/>
+      <geom class="visual" name="bucket_black_item9_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="-0.0320 -0.0650 0.0662" quat="0.86326 0.43071 -0.22973 0.12841"/>
+      <geom class="visual" name="bucket_black_item9_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="-0.0320 -0.0650 0.0662" quat="0.86326 0.43071 -0.22973 0.12841"/>
+      <geom class="visual" name="bucket_black_item9_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="-0.0320 -0.0650 0.0662" quat="0.86326 0.43071 -0.22973 0.12841"/>
+      <geom class="object_collision" name="bucket_black_item10" mesh="resistor_hull" pos="0.0518 -0.0060 0.0672" quat="0.85678 -0.45841 0.22328 -0.07702" mass="0.04"/>
+      <geom class="visual" name="bucket_black_item10_resistor_body" mesh="resistor_body" material="resistor_body" pos="0.0518 -0.0060 0.0672" quat="0.85678 -0.45841 0.22328 -0.07702"/>
+      <geom class="visual" name="bucket_black_item10_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="0.0518 -0.0060 0.0672" quat="0.85678 -0.45841 0.22328 -0.07702"/>
+      <geom class="visual" name="bucket_black_item10_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="0.0518 -0.0060 0.0672" quat="0.85678 -0.45841 0.22328 -0.07702"/>
+      <geom class="visual" name="bucket_black_item10_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="0.0518 -0.0060 0.0672" quat="0.85678 -0.45841 0.22328 -0.07702"/>
+      <geom class="object_collision" name="bucket_black_item11" mesh="resistor_hull" pos="0.0030 0.0120 0.0748" quat="0.73681 0.08460 0.66998 -0.03284" mass="0.04"/>
+      <geom class="visual" name="bucket_black_item11_resistor_body" mesh="resistor_body" material="resistor_body" pos="0.0030 0.0120 0.0748" quat="0.73681 0.08460 0.66998 -0.03284"/>
+      <geom class="visual" name="bucket_black_item11_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="0.0030 0.0120 0.0748" quat="0.73681 0.08460 0.66998 -0.03284"/>
+      <geom class="visual" name="bucket_black_item11_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="0.0030 0.0120 0.0748" quat="0.73681 0.08460 0.66998 -0.03284"/>
+      <geom class="visual" name="bucket_black_item11_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="0.0030 0.0120 0.0748" quat="0.73681 0.08460 0.66998 -0.03284"/>
+    </body>
+    <body name="bucket_green" pos="0.5639 -0.0618 0.0000" quat="0.763963 0 0 0.645260">
+      <freejoint name="bucket_green:joint"/>
+      <geom class="visual" mesh="bucket" material="bucket_green"/>
+      <geom class="bucket_collision" name="bucket_green_bottom" pos="0 -0.0125 0.003" size="0.075 0.08875 0.003"/>
+      <geom class="bucket_collision" name="bucket_green_wall_left" pos="0.072 0 0.063" size="0.003 0.10125 0.057"/>
+      <geom class="bucket_collision" name="bucket_green_wall_right" pos="-0.072 0 0.063" size="0.003 0.10125 0.057"/>
+      <geom class="bucket_collision" name="bucket_green_wall_end" pos="0 -0.09825 0.063" size="0.069 0.003 0.057"/>
+      <geom class="bucket_collision" name="bucket_green_lip" pos="0 0.0867 0.0195" euler="0.8789 0 0" size="0.069 0.0227 0.003"/>
+      <geom class="object_collision" name="bucket_green_item0" mesh="battery_hull" pos="-0.0509 -0.0373 0.0144" quat="0.00259 0.00246 -0.99999 0.00107" mass="0.045"/>
+      <geom class="visual" name="bucket_green_item0_battery_metal" mesh="battery_metal" material="battery_metal" pos="-0.0509 -0.0373 0.0144" quat="0.00259 0.00246 -0.99999 0.00107"/>
+      <geom class="visual" name="bucket_green_item0_battery_label" mesh="battery_label" material="battery_label" pos="-0.0509 -0.0373 0.0144" quat="0.00259 0.00246 -0.99999 0.00107"/>
+      <geom class="visual" name="bucket_green_item0_battery_band" mesh="battery_band" material="battery_band" pos="-0.0509 -0.0373 0.0144" quat="0.00259 0.00246 -0.99999 0.00107"/>
+      <geom class="object_collision" name="bucket_green_item1" mesh="battery_hull" pos="-0.0158 -0.0698 0.0144" quat="0.99991 -0.00061 0.00050 -0.01302" mass="0.045"/>
+      <geom class="visual" name="bucket_green_item1_battery_metal" mesh="battery_metal" material="battery_metal" pos="-0.0158 -0.0698 0.0144" quat="0.99991 -0.00061 0.00050 -0.01302"/>
+      <geom class="visual" name="bucket_green_item1_battery_label" mesh="battery_label" material="battery_label" pos="-0.0158 -0.0698 0.0144" quat="0.99991 -0.00061 0.00050 -0.01302"/>
+      <geom class="visual" name="bucket_green_item1_battery_band" mesh="battery_band" material="battery_band" pos="-0.0158 -0.0698 0.0144" quat="0.99991 -0.00061 0.00050 -0.01302"/>
+      <geom class="object_collision" name="bucket_green_item2" mesh="battery_hull" pos="0.0111 0.0350 0.0145" quat="0.98366 0.00011 0.00004 0.18001" mass="0.045"/>
+      <geom class="visual" name="bucket_green_item2_battery_metal" mesh="battery_metal" material="battery_metal" pos="0.0111 0.0350 0.0145" quat="0.98366 0.00011 0.00004 0.18001"/>
+      <geom class="visual" name="bucket_green_item2_battery_label" mesh="battery_label" material="battery_label" pos="0.0111 0.0350 0.0145" quat="0.98366 0.00011 0.00004 0.18001"/>
+      <geom class="visual" name="bucket_green_item2_battery_band" mesh="battery_band" material="battery_band" pos="0.0111 0.0350 0.0145" quat="0.98366 0.00011 0.00004 0.18001"/>
+      <geom class="object_collision" name="bucket_green_item3" mesh="battery_hull" pos="0.0140 -0.0556 0.0145" quat="0.99667 0.00014 -0.00008 -0.08157" mass="0.045"/>
+      <geom class="visual" name="bucket_green_item3_battery_metal" mesh="battery_metal" material="battery_metal" pos="0.0140 -0.0556 0.0145" quat="0.99667 0.00014 -0.00008 -0.08157"/>
+      <geom class="visual" name="bucket_green_item3_battery_label" mesh="battery_label" material="battery_label" pos="0.0140 -0.0556 0.0145" quat="0.99667 0.00014 -0.00008 -0.08157"/>
+      <geom class="visual" name="bucket_green_item3_battery_band" mesh="battery_band" material="battery_band" pos="0.0140 -0.0556 0.0145" quat="0.99667 0.00014 -0.00008 -0.08157"/>
+      <geom class="object_collision" name="bucket_green_item4" mesh="battery_hull" pos="-0.0178 -0.0133 0.0168" quat="0.99205 -0.00203 0.12524 0.01250" mass="0.045"/>
+      <geom class="visual" name="bucket_green_item4_battery_metal" mesh="battery_metal" material="battery_metal" pos="-0.0178 -0.0133 0.0168" quat="0.99205 -0.00203 0.12524 0.01250"/>
+      <geom class="visual" name="bucket_green_item4_battery_label" mesh="battery_label" material="battery_label" pos="-0.0178 -0.0133 0.0168" quat="0.99205 -0.00203 0.12524 0.01250"/>
+      <geom class="visual" name="bucket_green_item4_battery_band" mesh="battery_band" material="battery_band" pos="-0.0178 -0.0133 0.0168" quat="0.99205 -0.00203 0.12524 0.01250"/>
+      <geom class="object_collision" name="bucket_green_item5" mesh="battery_hull" pos="-0.0198 0.0384 0.0188" quat="0.69357 0.11937 -0.70012 0.12058" mass="0.045"/>
+      <geom class="visual" name="bucket_green_item5_battery_metal" mesh="battery_metal" material="battery_metal" pos="-0.0198 0.0384 0.0188" quat="0.69357 0.11937 -0.70012 0.12058"/>
+      <geom class="visual" name="bucket_green_item5_battery_label" mesh="battery_label" material="battery_label" pos="-0.0198 0.0384 0.0188" quat="0.69357 0.11937 -0.70012 0.12058"/>
+      <geom class="visual" name="bucket_green_item5_battery_band" mesh="battery_band" material="battery_band" pos="-0.0198 0.0384 0.0188" quat="0.69357 0.11937 -0.70012 0.12058"/>
+      <geom class="object_collision" name="bucket_green_item6" mesh="battery_hull" pos="0.0309 -0.0104 0.0205" quat="0.50787 0.20901 0.82583 -0.12801" mass="0.045"/>
+      <geom class="visual" name="bucket_green_item6_battery_metal" mesh="battery_metal" material="battery_metal" pos="0.0309 -0.0104 0.0205" quat="0.50787 0.20901 0.82583 -0.12801"/>
+      <geom class="visual" name="bucket_green_item6_battery_label" mesh="battery_label" material="battery_label" pos="0.0309 -0.0104 0.0205" quat="0.50787 0.20901 0.82583 -0.12801"/>
+      <geom class="visual" name="bucket_green_item6_battery_band" mesh="battery_band" material="battery_band" pos="0.0309 -0.0104 0.0205" quat="0.50787 0.20901 0.82583 -0.12801"/>
+      <geom class="object_collision" name="bucket_green_item7" mesh="battery_hull" pos="-0.0030 -0.0068 0.0304" quat="0.97202 0.02193 0.17629 0.15370" mass="0.045"/>
+      <geom class="visual" name="bucket_green_item7_battery_metal" mesh="battery_metal" material="battery_metal" pos="-0.0030 -0.0068 0.0304" quat="0.97202 0.02193 0.17629 0.15370"/>
+      <geom class="visual" name="bucket_green_item7_battery_label" mesh="battery_label" material="battery_label" pos="-0.0030 -0.0068 0.0304" quat="0.97202 0.02193 0.17629 0.15370"/>
+      <geom class="visual" name="bucket_green_item7_battery_band" mesh="battery_band" material="battery_band" pos="-0.0030 -0.0068 0.0304" quat="0.97202 0.02193 0.17629 0.15370"/>
+      <geom class="object_collision" name="bucket_green_item8" mesh="battery_hull" pos="-0.0437 -0.0257 0.0312" quat="0.99955 -0.00341 0.01074 -0.02789" mass="0.045"/>
+      <geom class="visual" name="bucket_green_item8_battery_metal" mesh="battery_metal" material="battery_metal" pos="-0.0437 -0.0257 0.0312" quat="0.99955 -0.00341 0.01074 -0.02789"/>
+      <geom class="visual" name="bucket_green_item8_battery_label" mesh="battery_label" material="battery_label" pos="-0.0437 -0.0257 0.0312" quat="0.99955 -0.00341 0.01074 -0.02789"/>
+      <geom class="visual" name="bucket_green_item8_battery_band" mesh="battery_band" material="battery_band" pos="-0.0437 -0.0257 0.0312" quat="0.99955 -0.00341 0.01074 -0.02789"/>
+      <geom class="object_collision" name="bucket_green_item9" mesh="battery_hull" pos="-0.0145 -0.0614 0.0313" quat="0.99888 -0.00157 0.00106 -0.04735" mass="0.045"/>
+      <geom class="visual" name="bucket_green_item9_battery_metal" mesh="battery_metal" material="battery_metal" pos="-0.0145 -0.0614 0.0313" quat="0.99888 -0.00157 0.00106 -0.04735"/>
+      <geom class="visual" name="bucket_green_item9_battery_label" mesh="battery_label" material="battery_label" pos="-0.0145 -0.0614 0.0313" quat="0.99888 -0.00157 0.00106 -0.04735"/>
+      <geom class="visual" name="bucket_green_item9_battery_band" mesh="battery_band" material="battery_band" pos="-0.0145 -0.0614 0.0313" quat="0.99888 -0.00157 0.00106 -0.04735"/>
+      <geom class="object_collision" name="bucket_green_item10" mesh="battery_hull" pos="0.0485 0.0191 0.0329" quat="0.85113 -0.43743 0.28657 0.04584" mass="0.045"/>
+      <geom class="visual" name="bucket_green_item10_battery_metal" mesh="battery_metal" material="battery_metal" pos="0.0485 0.0191 0.0329" quat="0.85113 -0.43743 0.28657 0.04584"/>
+      <geom class="visual" name="bucket_green_item10_battery_label" mesh="battery_label" material="battery_label" pos="0.0485 0.0191 0.0329" quat="0.85113 -0.43743 0.28657 0.04584"/>
+      <geom class="visual" name="bucket_green_item10_battery_band" mesh="battery_band" material="battery_band" pos="0.0485 0.0191 0.0329" quat="0.85113 -0.43743 0.28657 0.04584"/>
+      <geom class="object_collision" name="bucket_green_item11" mesh="battery_hull" pos="-0.0283 0.0517 0.0401" quat="0.99209 -0.00181 -0.01397 0.12472" mass="0.045"/>
+      <geom class="visual" name="bucket_green_item11_battery_metal" mesh="battery_metal" material="battery_metal" pos="-0.0283 0.0517 0.0401" quat="0.99209 -0.00181 -0.01397 0.12472"/>
+      <geom class="visual" name="bucket_green_item11_battery_label" mesh="battery_label" material="battery_label" pos="-0.0283 0.0517 0.0401" quat="0.99209 -0.00181 -0.01397 0.12472"/>
+      <geom class="visual" name="bucket_green_item11_battery_band" mesh="battery_band" material="battery_band" pos="-0.0283 0.0517 0.0401" quat="0.99209 -0.00181 -0.01397 0.12472"/>
+    </body>
+    <body name="bucket_red" pos="0.5651 0.0967 0.0000" quat="0.671303 0 0 0.741183">
+      <freejoint name="bucket_red:joint"/>
+      <geom class="visual" mesh="bucket" material="bucket_red"/>
+      <geom class="bucket_collision" name="bucket_red_bottom" pos="0 -0.0125 0.003" size="0.075 0.08875 0.003"/>
+      <geom class="bucket_collision" name="bucket_red_wall_left" pos="0.072 0 0.063" size="0.003 0.10125 0.057"/>
+      <geom class="bucket_collision" name="bucket_red_wall_right" pos="-0.072 0 0.063" size="0.003 0.10125 0.057"/>
+      <geom class="bucket_collision" name="bucket_red_wall_end" pos="0 -0.09825 0.063" size="0.069 0.003 0.057"/>
+      <geom class="bucket_collision" name="bucket_red_lip" pos="0 0.0867 0.0195" euler="0.8789 0 0" size="0.069 0.0227 0.003"/>
+      <geom class="object_collision" name="bucket_red_item0" mesh="cpu_hull" pos="-0.0343 -0.0393 0.0161" quat="0.99999 0.00080 0.00468 0.00148" mass="0.03"/>
+      <geom class="visual" name="bucket_red_item0_cpu_body" mesh="cpu_body" material="cpu_body" pos="-0.0343 -0.0393 0.0161" quat="0.99999 0.00080 0.00468 0.00148"/>
+      <geom class="visual" name="bucket_red_item0_cpu_marking" mesh="cpu_marking" material="cpu_marking" pos="-0.0343 -0.0393 0.0161" quat="0.99999 0.00080 0.00468 0.00148"/>
+      <geom class="visual" name="bucket_red_item0_cpu_legs" mesh="cpu_legs" material="cpu_legs" pos="-0.0343 -0.0393 0.0161" quat="0.99999 0.00080 0.00468 0.00148"/>
+      <geom class="object_collision" name="bucket_red_item1" mesh="cpu_hull" pos="-0.0102 -0.0785 0.0228" quat="0.38232 0.92403 0.00094 0.00043" mass="0.03"/>
+      <geom class="visual" name="bucket_red_item1_cpu_body" mesh="cpu_body" material="cpu_body" pos="-0.0102 -0.0785 0.0228" quat="0.38232 0.92403 0.00094 0.00043"/>
+      <geom class="visual" name="bucket_red_item1_cpu_marking" mesh="cpu_marking" material="cpu_marking" pos="-0.0102 -0.0785 0.0228" quat="0.38232 0.92403 0.00094 0.00043"/>
+      <geom class="visual" name="bucket_red_item1_cpu_legs" mesh="cpu_legs" material="cpu_legs" pos="-0.0102 -0.0785 0.0228" quat="0.38232 0.92403 0.00094 0.00043"/>
+      <geom class="object_collision" name="bucket_red_item2" mesh="cpu_hull" pos="-0.0101 -0.0100 0.0260" quat="0.93604 -0.35086 0.00790 -0.02568" mass="0.03"/>
+      <geom class="visual" name="bucket_red_item2_cpu_body" mesh="cpu_body" material="cpu_body" pos="-0.0101 -0.0100 0.0260" quat="0.93604 -0.35086 0.00790 -0.02568"/>
+      <geom class="visual" name="bucket_red_item2_cpu_marking" mesh="cpu_marking" material="cpu_marking" pos="-0.0101 -0.0100 0.0260" quat="0.93604 -0.35086 0.00790 -0.02568"/>
+      <geom class="visual" name="bucket_red_item2_cpu_legs" mesh="cpu_legs" material="cpu_legs" pos="-0.0101 -0.0100 0.0260" quat="0.93604 -0.35086 0.00790 -0.02568"/>
+      <geom class="object_collision" name="bucket_red_item3" mesh="cpu_hull" pos="-0.0132 0.0167 0.0305" quat="0.92387 -0.34933 0.06312 0.14301" mass="0.03"/>
+      <geom class="visual" name="bucket_red_item3_cpu_body" mesh="cpu_body" material="cpu_body" pos="-0.0132 0.0167 0.0305" quat="0.92387 -0.34933 0.06312 0.14301"/>
+      <geom class="visual" name="bucket_red_item3_cpu_marking" mesh="cpu_marking" material="cpu_marking" pos="-0.0132 0.0167 0.0305" quat="0.92387 -0.34933 0.06312 0.14301"/>
+      <geom class="visual" name="bucket_red_item3_cpu_legs" mesh="cpu_legs" material="cpu_legs" pos="-0.0132 0.0167 0.0305" quat="0.92387 -0.34933 0.06312 0.14301"/>
+      <geom class="object_collision" name="bucket_red_item4" mesh="cpu_hull" pos="0.0314 0.0388 0.0354" quat="0.81172 -0.53247 0.13737 -0.19675" mass="0.03"/>
+      <geom class="visual" name="bucket_red_item4_cpu_body" mesh="cpu_body" material="cpu_body" pos="0.0314 0.0388 0.0354" quat="0.81172 -0.53247 0.13737 -0.19675"/>
+      <geom class="visual" name="bucket_red_item4_cpu_marking" mesh="cpu_marking" material="cpu_marking" pos="0.0314 0.0388 0.0354" quat="0.81172 -0.53247 0.13737 -0.19675"/>
+      <geom class="visual" name="bucket_red_item4_cpu_legs" mesh="cpu_legs" material="cpu_legs" pos="0.0314 0.0388 0.0354" quat="0.81172 -0.53247 0.13737 -0.19675"/>
+      <geom class="object_collision" name="bucket_red_item5" mesh="cpu_hull" pos="0.0315 -0.0477 0.0392" quat="0.88039 0.45187 0.00848 -0.14374" mass="0.03"/>
+      <geom class="visual" name="bucket_red_item5_cpu_body" mesh="cpu_body" material="cpu_body" pos="0.0315 -0.0477 0.0392" quat="0.88039 0.45187 0.00848 -0.14374"/>
+      <geom class="visual" name="bucket_red_item5_cpu_marking" mesh="cpu_marking" material="cpu_marking" pos="0.0315 -0.0477 0.0392" quat="0.88039 0.45187 0.00848 -0.14374"/>
+      <geom class="visual" name="bucket_red_item5_cpu_legs" mesh="cpu_legs" material="cpu_legs" pos="0.0315 -0.0477 0.0392" quat="0.88039 0.45187 0.00848 -0.14374"/>
+      <geom class="object_collision" name="bucket_red_item6" mesh="cpu_hull" pos="0.0320 0.0832 0.0415" quat="0.50572 -0.80342 0.26804 -0.16406" mass="0.03"/>
+      <geom class="visual" name="bucket_red_item6_cpu_body" mesh="cpu_body" material="cpu_body" pos="0.0320 0.0832 0.0415" quat="0.50572 -0.80342 0.26804 -0.16406"/>
+      <geom class="visual" name="bucket_red_item6_cpu_marking" mesh="cpu_marking" material="cpu_marking" pos="0.0320 0.0832 0.0415" quat="0.50572 -0.80342 0.26804 -0.16406"/>
+      <geom class="visual" name="bucket_red_item6_cpu_legs" mesh="cpu_legs" material="cpu_legs" pos="0.0320 0.0832 0.0415" quat="0.50572 -0.80342 0.26804 -0.16406"/>
+      <geom class="object_collision" name="bucket_red_item7" mesh="cpu_hull" pos="-0.0274 0.0494 0.0454" quat="0.36460 0.00937 0.91261 -0.18473" mass="0.03"/>
+      <geom class="visual" name="bucket_red_item7_cpu_body" mesh="cpu_body" material="cpu_body" pos="-0.0274 0.0494 0.0454" quat="0.36460 0.00937 0.91261 -0.18473"/>
+      <geom class="visual" name="bucket_red_item7_cpu_marking" mesh="cpu_marking" material="cpu_marking" pos="-0.0274 0.0494 0.0454" quat="0.36460 0.00937 0.91261 -0.18473"/>
+      <geom class="visual" name="bucket_red_item7_cpu_legs" mesh="cpu_legs" material="cpu_legs" pos="-0.0274 0.0494 0.0454" quat="0.36460 0.00937 0.91261 -0.18473"/>
+      <geom class="object_collision" name="bucket_red_item8" mesh="cpu_hull" pos="-0.0141 -0.0719 0.0465" quat="0.32513 0.94004 -0.09738 0.03365" mass="0.03"/>
+      <geom class="visual" name="bucket_red_item8_cpu_body" mesh="cpu_body" material="cpu_body" pos="-0.0141 -0.0719 0.0465" quat="0.32513 0.94004 -0.09738 0.03365"/>
+      <geom class="visual" name="bucket_red_item8_cpu_marking" mesh="cpu_marking" material="cpu_marking" pos="-0.0141 -0.0719 0.0465" quat="0.32513 0.94004 -0.09738 0.03365"/>
+      <geom class="visual" name="bucket_red_item8_cpu_legs" mesh="cpu_legs" material="cpu_legs" pos="-0.0141 -0.0719 0.0465" quat="0.32513 0.94004 -0.09738 0.03365"/>
+      <geom class="object_collision" name="bucket_red_item9" mesh="cpu_hull" pos="0.0145 -0.0071 0.0508" quat="0.91558 -0.35893 0.07874 0.16334" mass="0.03"/>
+      <geom class="visual" name="bucket_red_item9_cpu_body" mesh="cpu_body" material="cpu_body" pos="0.0145 -0.0071 0.0508" quat="0.91558 -0.35893 0.07874 0.16334"/>
+      <geom class="visual" name="bucket_red_item9_cpu_marking" mesh="cpu_marking" material="cpu_marking" pos="0.0145 -0.0071 0.0508" quat="0.91558 -0.35893 0.07874 0.16334"/>
+      <geom class="visual" name="bucket_red_item9_cpu_legs" mesh="cpu_legs" material="cpu_legs" pos="0.0145 -0.0071 0.0508" quat="0.91558 -0.35893 0.07874 0.16334"/>
+      <geom class="object_collision" name="bucket_red_item10" mesh="cpu_hull" pos="-0.0315 0.0141 0.0612" quat="0.92766 -0.36036 -0.02821 -0.09372" mass="0.03"/>
+      <geom class="visual" name="bucket_red_item10_cpu_body" mesh="cpu_body" material="cpu_body" pos="-0.0315 0.0141 0.0612" quat="0.92766 -0.36036 -0.02821 -0.09372"/>
+      <geom class="visual" name="bucket_red_item10_cpu_marking" mesh="cpu_marking" material="cpu_marking" pos="-0.0315 0.0141 0.0612" quat="0.92766 -0.36036 -0.02821 -0.09372"/>
+      <geom class="visual" name="bucket_red_item10_cpu_legs" mesh="cpu_legs" material="cpu_legs" pos="-0.0315 0.0141 0.0612" quat="0.92766 -0.36036 -0.02821 -0.09372"/>
+      <geom class="object_collision" name="bucket_red_item11" mesh="cpu_hull" pos="0.0129 -0.0502 0.0673" quat="0.87772 0.44931 0.01937 -0.16540" mass="0.03"/>
+      <geom class="visual" name="bucket_red_item11_cpu_body" mesh="cpu_body" material="cpu_body" pos="0.0129 -0.0502 0.0673" quat="0.87772 0.44931 0.01937 -0.16540"/>
+      <geom class="visual" name="bucket_red_item11_cpu_marking" mesh="cpu_marking" material="cpu_marking" pos="0.0129 -0.0502 0.0673" quat="0.87772 0.44931 0.01937 -0.16540"/>
+      <geom class="visual" name="bucket_red_item11_cpu_legs" mesh="cpu_legs" material="cpu_legs" pos="0.0129 -0.0502 0.0673" quat="0.87772 0.44931 0.01937 -0.16540"/>
+    </body>
+    <body name="bucket_blue" pos="0.5345 0.2656 0.0000" quat="0.618792 0 0 0.785555">
+      <freejoint name="bucket_blue:joint"/>
+      <geom class="visual" mesh="bucket" material="bucket_blue"/>
+      <geom class="bucket_collision" name="bucket_blue_bottom" pos="0 -0.0125 0.003" size="0.075 0.08875 0.003"/>
+      <geom class="bucket_collision" name="bucket_blue_wall_left" pos="0.072 0 0.063" size="0.003 0.10125 0.057"/>
+      <geom class="bucket_collision" name="bucket_blue_wall_right" pos="-0.072 0 0.063" size="0.003 0.10125 0.057"/>
+      <geom class="bucket_collision" name="bucket_blue_wall_end" pos="0 -0.09825 0.063" size="0.069 0.003 0.057"/>
+      <geom class="bucket_collision" name="bucket_blue_lip" pos="0 0.0867 0.0195" euler="0.8789 0 0" size="0.069 0.0227 0.003"/>
+      <geom class="object_collision" name="bucket_blue_item0" mesh="resistor_hull" pos="0.0412 -0.0528 0.0208" quat="0.99996 -0.00061 0.00811 0.00239" mass="0.04"/>
+      <geom class="visual" name="bucket_blue_item0_resistor_body" mesh="resistor_body" material="resistor_body" pos="0.0412 -0.0528 0.0208" quat="0.99996 -0.00061 0.00811 0.00239"/>
+      <geom class="visual" name="bucket_blue_item0_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="0.0412 -0.0528 0.0208" quat="0.99996 -0.00061 0.00811 0.00239"/>
+      <geom class="visual" name="bucket_blue_item0_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="0.0412 -0.0528 0.0208" quat="0.99996 -0.00061 0.00811 0.00239"/>
+      <geom class="visual" name="bucket_blue_item0_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="0.0412 -0.0528 0.0208" quat="0.99996 -0.00061 0.00811 0.00239"/>
+      <geom class="object_collision" name="bucket_blue_item1" mesh="resistor_hull" pos="-0.0009 -0.0202 0.0285" quat="0.96978 0.14093 0.18767 -0.06673" mass="0.04"/>
+      <geom class="visual" name="bucket_blue_item1_resistor_body" mesh="resistor_body" material="resistor_body" pos="-0.0009 -0.0202 0.0285" quat="0.96978 0.14093 0.18767 -0.06673"/>
+      <geom class="visual" name="bucket_blue_item1_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="-0.0009 -0.0202 0.0285" quat="0.96978 0.14093 0.18767 -0.06673"/>
+      <geom class="visual" name="bucket_blue_item1_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="-0.0009 -0.0202 0.0285" quat="0.96978 0.14093 0.18767 -0.06673"/>
+      <geom class="visual" name="bucket_blue_item1_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="-0.0009 -0.0202 0.0285" quat="0.96978 0.14093 0.18767 -0.06673"/>
+      <geom class="object_collision" name="bucket_blue_item2" mesh="resistor_hull" pos="-0.0402 -0.0596 0.0296" quat="0.63101 0.31233 -0.70654 0.07121" mass="0.04"/>
+      <geom class="visual" name="bucket_blue_item2_resistor_body" mesh="resistor_body" material="resistor_body" pos="-0.0402 -0.0596 0.0296" quat="0.63101 0.31233 -0.70654 0.07121"/>
+      <geom class="visual" name="bucket_blue_item2_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="-0.0402 -0.0596 0.0296" quat="0.63101 0.31233 -0.70654 0.07121"/>
+      <geom class="visual" name="bucket_blue_item2_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="-0.0402 -0.0596 0.0296" quat="0.63101 0.31233 -0.70654 0.07121"/>
+      <geom class="visual" name="bucket_blue_item2_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="-0.0402 -0.0596 0.0296" quat="0.63101 0.31233 -0.70654 0.07121"/>
+      <geom class="object_collision" name="bucket_blue_item3" mesh="resistor_hull" pos="-0.0168 0.0466 0.0310" quat="0.98154 0.19114 0.00424 0.00522" mass="0.04"/>
+      <geom class="visual" name="bucket_blue_item3_resistor_body" mesh="resistor_body" material="resistor_body" pos="-0.0168 0.0466 0.0310" quat="0.98154 0.19114 0.00424 0.00522"/>
+      <geom class="visual" name="bucket_blue_item3_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="-0.0168 0.0466 0.0310" quat="0.98154 0.19114 0.00424 0.00522"/>
+      <geom class="visual" name="bucket_blue_item3_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="-0.0168 0.0466 0.0310" quat="0.98154 0.19114 0.00424 0.00522"/>
+      <geom class="visual" name="bucket_blue_item3_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="-0.0168 0.0466 0.0310" quat="0.98154 0.19114 0.00424 0.00522"/>
+      <geom class="object_collision" name="bucket_blue_item4" mesh="resistor_hull" pos="-0.0326 -0.0144 0.0367" quat="0.80868 -0.19101 -0.46211 0.30984" mass="0.04"/>
+      <geom class="visual" name="bucket_blue_item4_resistor_body" mesh="resistor_body" material="resistor_body" pos="-0.0326 -0.0144 0.0367" quat="0.80868 -0.19101 -0.46211 0.30984"/>
+      <geom class="visual" name="bucket_blue_item4_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="-0.0326 -0.0144 0.0367" quat="0.80868 -0.19101 -0.46211 0.30984"/>
+      <geom class="visual" name="bucket_blue_item4_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="-0.0326 -0.0144 0.0367" quat="0.80868 -0.19101 -0.46211 0.30984"/>
+      <geom class="visual" name="bucket_blue_item4_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="-0.0326 -0.0144 0.0367" quat="0.80868 -0.19101 -0.46211 0.30984"/>
+      <geom class="object_collision" name="bucket_blue_item5" mesh="resistor_hull" pos="0.0140 -0.0635 0.0371" quat="0.59043 0.39136 0.69332 0.13241" mass="0.04"/>
+      <geom class="visual" name="bucket_blue_item5_resistor_body" mesh="resistor_body" material="resistor_body" pos="0.0140 -0.0635 0.0371" quat="0.59043 0.39136 0.69332 0.13241"/>
+      <geom class="visual" name="bucket_blue_item5_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="0.0140 -0.0635 0.0371" quat="0.59043 0.39136 0.69332 0.13241"/>
+      <geom class="visual" name="bucket_blue_item5_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="0.0140 -0.0635 0.0371" quat="0.59043 0.39136 0.69332 0.13241"/>
+      <geom class="visual" name="bucket_blue_item5_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="0.0140 -0.0635 0.0371" quat="0.59043 0.39136 0.69332 0.13241"/>
+      <geom class="object_collision" name="bucket_blue_item6" mesh="resistor_hull" pos="-0.0525 0.0413 0.0397" quat="-0.17570 0.17817 -0.68422 0.68500" mass="0.04"/>
+      <geom class="visual" name="bucket_blue_item6_resistor_body" mesh="resistor_body" material="resistor_body" pos="-0.0525 0.0413 0.0397" quat="-0.17570 0.17817 -0.68422 0.68500"/>
+      <geom class="visual" name="bucket_blue_item6_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="-0.0525 0.0413 0.0397" quat="-0.17570 0.17817 -0.68422 0.68500"/>
+      <geom class="visual" name="bucket_blue_item6_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="-0.0525 0.0413 0.0397" quat="-0.17570 0.17817 -0.68422 0.68500"/>
+      <geom class="visual" name="bucket_blue_item6_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="-0.0525 0.0413 0.0397" quat="-0.17570 0.17817 -0.68422 0.68500"/>
+      <geom class="object_collision" name="bucket_blue_item7" mesh="resistor_hull" pos="0.0519 0.0469 0.0398" quat="0.69872 -0.71287 -0.04158 0.04333" mass="0.04"/>
+      <geom class="visual" name="bucket_blue_item7_resistor_body" mesh="resistor_body" material="resistor_body" pos="0.0519 0.0469 0.0398" quat="0.69872 -0.71287 -0.04158 0.04333"/>
+      <geom class="visual" name="bucket_blue_item7_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="0.0519 0.0469 0.0398" quat="0.69872 -0.71287 -0.04158 0.04333"/>
+      <geom class="visual" name="bucket_blue_item7_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="0.0519 0.0469 0.0398" quat="0.69872 -0.71287 -0.04158 0.04333"/>
+      <geom class="visual" name="bucket_blue_item7_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="0.0519 0.0469 0.0398" quat="0.69872 -0.71287 -0.04158 0.04333"/>
+      <geom class="object_collision" name="bucket_blue_item8" mesh="resistor_hull" pos="0.0264 0.0284 0.0481" quat="0.85846 -0.33665 -0.20298 0.32940" mass="0.04"/>
+      <geom class="visual" name="bucket_blue_item8_resistor_body" mesh="resistor_body" material="resistor_body" pos="0.0264 0.0284 0.0481" quat="0.85846 -0.33665 -0.20298 0.32940"/>
+      <geom class="visual" name="bucket_blue_item8_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="0.0264 0.0284 0.0481" quat="0.85846 -0.33665 -0.20298 0.32940"/>
+      <geom class="visual" name="bucket_blue_item8_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="0.0264 0.0284 0.0481" quat="0.85846 -0.33665 -0.20298 0.32940"/>
+      <geom class="visual" name="bucket_blue_item8_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="0.0264 0.0284 0.0481" quat="0.85846 -0.33665 -0.20298 0.32940"/>
+      <geom class="object_collision" name="bucket_blue_item9" mesh="resistor_hull" pos="0.0415 -0.0205 0.0624" quat="0.57112 -0.48575 0.64522 -0.14685" mass="0.04"/>
+      <geom class="visual" name="bucket_blue_item9_resistor_body" mesh="resistor_body" material="resistor_body" pos="0.0415 -0.0205 0.0624" quat="0.57112 -0.48575 0.64522 -0.14685"/>
+      <geom class="visual" name="bucket_blue_item9_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="0.0415 -0.0205 0.0624" quat="0.57112 -0.48575 0.64522 -0.14685"/>
+      <geom class="visual" name="bucket_blue_item9_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="0.0415 -0.0205 0.0624" quat="0.57112 -0.48575 0.64522 -0.14685"/>
+      <geom class="visual" name="bucket_blue_item9_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="0.0415 -0.0205 0.0624" quat="0.57112 -0.48575 0.64522 -0.14685"/>
+      <geom class="object_collision" name="bucket_blue_item10" mesh="resistor_hull" pos="-0.0214 0.0010 0.0652" quat="0.85658 -0.21854 -0.41280 0.21935" mass="0.04"/>
+      <geom class="visual" name="bucket_blue_item10_resistor_body" mesh="resistor_body" material="resistor_body" pos="-0.0214 0.0010 0.0652" quat="0.85658 -0.21854 -0.41280 0.21935"/>
+      <geom class="visual" name="bucket_blue_item10_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="-0.0214 0.0010 0.0652" quat="0.85658 -0.21854 -0.41280 0.21935"/>
+      <geom class="visual" name="bucket_blue_item10_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="-0.0214 0.0010 0.0652" quat="0.85658 -0.21854 -0.41280 0.21935"/>
+      <geom class="visual" name="bucket_blue_item10_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="-0.0214 0.0010 0.0652" quat="0.85658 -0.21854 -0.41280 0.21935"/>
+      <geom class="object_collision" name="bucket_blue_item11" mesh="resistor_hull" pos="0.0138 -0.0618 0.0775" quat="0.92004 0.29067 -0.19642 -0.17450" mass="0.04"/>
+      <geom class="visual" name="bucket_blue_item11_resistor_body" mesh="resistor_body" material="resistor_body" pos="0.0138 -0.0618 0.0775" quat="0.92004 0.29067 -0.19642 -0.17450"/>
+      <geom class="visual" name="bucket_blue_item11_resistor_band_brown" mesh="resistor_band_brown" material="band_brown" pos="0.0138 -0.0618 0.0775" quat="0.92004 0.29067 -0.19642 -0.17450"/>
+      <geom class="visual" name="bucket_blue_item11_resistor_band_red" mesh="resistor_band_red" material="band_red" pos="0.0138 -0.0618 0.0775" quat="0.92004 0.29067 -0.19642 -0.17450"/>
+      <geom class="visual" name="bucket_blue_item11_resistor_band_yellow" mesh="resistor_band_yellow" material="band_yellow" pos="0.0138 -0.0618 0.0775" quat="0.92004 0.29067 -0.19642 -0.17450"/>
+    </body>
+    <!-- Objects, real size, origin at the centre of their bounding box, lying flat. Visuals: one
+         mesh per source material. Collision: the convex hull of the visual meshes. -->
+    <body name="resistor" pos="0.30 0.15 0.0155">
+      <joint type="free" name="resistor:joint"/>
+      <geom class="object_collision" name="resistor_collision" mesh="resistor_hull" mass="0.040"/>
+      <geom class="visual" mesh="resistor_body" material="resistor_body"/>
+      <geom class="visual" mesh="resistor_band_brown" material="band_brown"/>
+      <geom class="visual" mesh="resistor_band_red" material="band_red"/>
+      <geom class="visual" mesh="resistor_band_yellow" material="band_yellow"/>
+    </body>
+    <body name="battery" pos="0.33 0 0.0091">
+      <joint type="free" name="battery:joint"/>
+      <geom class="object_collision" name="battery_collision" mesh="battery_hull" mass="0.045"/>
+      <geom class="visual" mesh="battery_metal" material="battery_metal"/>
+      <geom class="visual" mesh="battery_label" material="battery_label"/>
+      <geom class="visual" mesh="battery_band" material="battery_band"/>
+    </body>
+    <body name="cpu" pos="0.30 -0.15 0.0110">
+      <joint type="free" name="cpu:joint"/>
+      <geom class="object_collision" name="cpu_collision" mesh="cpu_hull" mass="0.030"/>
+      <geom class="visual" mesh="cpu_body" material="cpu_body"/>
+      <geom class="visual" mesh="cpu_marking" material="cpu_marking"/>
+      <geom class="visual" mesh="cpu_legs" material="cpu_legs"/>
+    </body>
+    <frame name="robot_mount" pos="0 0 0.0106"/>
+    <!-- The overview camera on its leaning pole, left of the robot: position from the splat (the camera body above
+         its ball head), aimed at bucket_sort's task point (0.45, 0.00, 0.05): the real camera was set up
+         to that schematic, and its orientation cannot be measured from outside. Level image. -->
+    <geom name="overview_pole" type="capsule" fromto="-0.0177 0.5045 0.0000 -0.0259 0.5088 0.4300" size="0.011" material="pole"/>
+    <geom name="overview_pole_upper" type="capsule" fromto="-0.0259 0.5088 0.4300 0.1610 0.4713 0.6838" size="0.011" material="pole"/>
+    <body name="overview_camera_rig" pos="0.1610 0.4713 0.7238" xyaxes="-0.8525 -0.5227 0.0000 0.4040 -0.6591 0.6343">
+      <body name="overview_camera_tilt">
+        <camera name="overview" mode="fixed" fovy="42"/>
+        <!-- the housing behind the front face (the camera looks along -z): an Intel RealSense D4xx bar (the label is legible in the video), D435-sized 90 x 25 x 25 mm, silver -->
+        <geom name="overview_housing" type="box" pos="0 0 0.0125" size="0.045 0.0125 0.0125" rgba="0.80 0.80 0.80 1" contype="0" conaffinity="0" group="2"/>
+      </body>
+    </body>
+    <!-- a free viewpoint for renders at other poses (the real2sim compositor moves this body; no geoms) -->
+    <body name="render_camera_rig" pos="0 0 2.0">
+      <camera name="render" mode="fixed" fovy="45"/>
+    </body>
+  </worldbody>
+</mujoco>

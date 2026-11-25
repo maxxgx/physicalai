@@ -297,6 +297,20 @@ class ConveyorAutomation:
         logger.info("Autopilot {}", mode)
         return True
 
+    def set_start_gate(self, *, enabled: bool | None = None, go: bool = False) -> bool:
+        """r16: pass the start gate (plan before record) to the scene's demonstrator, if it has one.
+
+        Returns:
+            Whether the demonstrator takes it.
+        """
+        demo = self.autopilot.demonstrator
+        setter = getattr(demo, "set_start_gate", None)
+        if setter is None:
+            logger.warning("The current scene's demonstrator has no start gate")
+            return False
+        setter(enabled=enabled, go=go)
+        return True
+
     def set_studio_recording(self, options: RecordingOptions | None) -> bool:
         """Switch automatic Studio recording on with `options`, or off with ``None``.
 
@@ -355,6 +369,8 @@ class ConveyorAutomation:
         if self._bucket_task is not None:
             bucket = self.bucket_recorder.update(self._bucket_progress(model, data))
             hold_arm = bucket.hold_arm
+            if bucket.reset_scene and self.autopilot.status().get("outcome") == "success":
+                self._bucket_task.offer_continue()  # a sorting sequence may go on from this table
             self._recorder_reset = self._recorder_reset or bucket.reset_scene
             if bucket.abort_stuck_start:
                 # Nothing more is written to the arm, and client actions count again.

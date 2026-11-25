@@ -51,6 +51,10 @@ class ChannelOverride:
     velocity_unit: Literal["public", "model"] = "public"
 
 
+Vec3 = tuple[float, float, float]
+Rgba = tuple[float, float, float, float]
+
+
 @dataclass(frozen=True)
 class CameraSpec:
     """A robot camera: its unprefixed public name and its pose in a robot body.
@@ -68,6 +72,38 @@ class CameraSpec:
     fovy: float
     """Vertical field of view in degrees."""
     source: CameraSource = "override"
+    housing: tuple[float, float, float] | None = None
+    """Half sizes (x, y, depth) in metres of the camera's body, drawn as a visual box behind its front face
+    (the camera frame's origin), so that other cameras see it; ``None`` draws nothing."""
+    mount: tuple[Vec3, Vec3, Rgba] | None = None
+    """The camera's bracket as a visual box: centre and half sizes in the parent body's frame (axis-aligned), and
+    its colour; ``None`` draws nothing."""
+    mount_hull: tuple[tuple[Vec3, ...], Rgba] | None = None
+    """The camera's bracket as a visual convex hull: its vertices in the parent body's frame, and its colour; it
+    replaces :attr:`mount` when both are given."""
+    mount_mesh: CameraMount | None = None
+    """The camera's bracket from its CAD and the camera's body on it, drawn and colliding (:class:`CameraMount`); it
+    replaces :attr:`mount_hull`, :attr:`mount` and :attr:`housing` when given."""
+
+
+@dataclass(frozen=True, eq=False)
+class CameraMount:
+    """A camera's bracket from its CAD, and the camera's body seated on it, in the camera's parent body (metres).
+
+    The bracket is drawn as its mesh and collides as convex ``pieces`` (their union contains the drawing); planning
+    may use the coarser ``proxies`` (each a hull of whole pieces). The camera's body is one box, drawn and colliding.
+    """
+
+    vertices: tuple[Vec3, ...]
+    faces: tuple[tuple[int, int, int], ...]
+    rgba: Rgba
+    pieces: tuple[tuple[Vec3, ...], ...]
+    proxies: tuple[tuple[Vec3, ...], ...]
+    body_pos: Vec3
+    body_quat: tuple[float, float, float, float]
+    """The camera body's box centre and orientation (``wxyz``)."""
+    body_half: Vec3
+    body_rgba: Rgba
 
 
 @dataclass(frozen=True)

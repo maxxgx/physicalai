@@ -207,6 +207,8 @@ class TestDemonstrator:
             return plan
 
         monkeypatch.setattr(planner, "checked", checked)
+        # r16: the stand-in turns the first plan made into the refused one; the screen-first second pass would not
+        monkeypatch.setattr(bd, "SCREEN_FIRST", False)
         params = bd.DemoParams.for_heights(demo.active_arm.heights)
         instruction = scene._sim.on_reset.instruction
         snapshot = bd.SceneSnapshot.take(data)

@@ -22,6 +22,13 @@
 
 * **mujoco:** `POST /studio/recording` (now `404`), the viewer's **Record in Studio** controls, the `start --studio-url` option and `MuJoCoRobot(studio_url=...)`: the simulation no longer connects to Studio, whose websocket session it used has not worked since Studio's runtime sessions changed. Studio records the autopilot from its recording page instead.
 
+## [0.6.1](https://github.com/openvinotoolkit/physicalai/compare/physicalai-mujoco-plugin-v0.6.0...physicalai-mujoco-plugin-v0.6.1) (2026-11-25)
+
+
+### 🐛 Bug Fixes
+
+* **mujoco:** cap mjviser to avoid conflicting MuJoCo packages ([#489](https://github.com/openvinotoolkit/physicalai/issues/489)) ([6fe5d0f](https://github.com/openvinotoolkit/physicalai/commit/6fe5d0f0a81c62c90055d3bc93ea83f584874052))
+
 ## [0.6.0](https://github.com/openvinotoolkit/physicalai/compare/physicalai-mujoco-plugin-v0.5.0...physicalai-mujoco-plugin-v0.6.0) (2026-11-20)
 
 

@@ -79,10 +79,11 @@ class RerunCallback:
     most 0.5 s at shutdown): the control loop never waits for Rerun. Events are
     dropped while Rerun falls behind, and after Rerun stalls nothing is
     guaranteed to reach the viewer or, with ``mode="save"``, the ``.rrd`` file.
-    A subclass that defines action hooks runs synchronously, with a warning,
-    since those must return on the control thread. Code that calls the hooks
-    directly, as Studio's Rerun observer does from its own thread, gets the
-    synchronous behaviour.
+    The marker is read from the class that sets it only: a subclass runs
+    synchronously, as on main, unless it sets ``run_in_background = True``
+    itself (and defines no action hooks). Code that calls the hooks directly,
+    as Studio's Rerun observer does from its own thread, gets the synchronous
+    behaviour.
 
     ``mode`` selects where data goes:
 

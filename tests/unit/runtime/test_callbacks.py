@@ -351,6 +351,8 @@ class TestBackgroundCallbacks:
 
     def test_a_marked_callback_with_action_hooks_stays_synchronous(self, caplog: pytest.LogCaptureFixture) -> None:
         class _WithActionHook(_BlockingCallback):
+            run_in_background = True  # the marker only counts on the class that sets it
+
             def on_action_ready(self, *, action: np.ndarray, step: int) -> np.ndarray:  # noqa: ARG002
                 return action
 
@@ -400,6 +402,77 @@ class TestBackgroundCallbacks:
         assert first.closed_on is None  # the user's callback is not closed by the rollback
         bus.close()
         assert first.closed_on == threading.current_thread().name
+
+    def test_a_subclass_does_not_inherit_the_marker(self) -> None:
+        class _Subclass(_BlockingCallback):
+            pass
+
+        class _OptedIn(_BlockingCallback):
+            run_in_background = True
+
+        sub, opted = _Subclass(), _OptedIn()
+        bus = _CallbackBus([sub, opted])
+        bus.start_background()
+
+        assert bus._callbacks[0] is sub
+        assert isinstance(bus._callbacks[1], AsyncCallback)
+        opted.release.set()
+        bus.close()
+
+    def test_a_failed_setup_is_retried_on_the_next_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import physicalai.runtime._callback_bus as bus_module
+
+        real = bus_module.AsyncCallback
+        calls = 0
+
+        def fails_once(inner: object, **kwargs: Any) -> AsyncCallback:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("first setup fails")
+            return real(inner, **kwargs)
+
+        monkeypatch.setattr(bus_module, "AsyncCallback", fails_once)
+        inner = _BlockingCallback()
+        bus = _CallbackBus([inner])
+        with pytest.raises(RuntimeError, match="first setup fails"):
+            bus.start_background()
+        assert bus._callbacks == [inner]
+        bus.start_background()  # the next run
+
+        assert isinstance(bus._callbacks[0], AsyncCallback)
+        inner.release.set()
+        bus.close()
+
+    def test_repeated_sessions_with_a_stalled_worker_stay_bounded(self) -> None:
+        import time
+
+        from physicalai.runtime.callbacks import async_callback as module
+
+        inner = _BlockingCallback()
+        cb = AsyncCallback(inner, max_queue=4, flush_timeout_s=0.5)
+        cb.on_tick(self._tick(0))
+        assert inner.entered.wait(1.0)  # the worker is stuck from here on
+        per_session: list[float] = []
+        for session in range(2000):
+            started = time.perf_counter()
+            cb.on_lifecycle(_lifecycle("start"))
+            for step in range(5):
+                cb.on_tick(self._tick(session * 10 + step))
+            cb.on_lifecycle(_lifecycle("stop_requested"))
+            cb.on_lifecycle(_lifecycle("shutdown"))
+            per_session.append(time.perf_counter() - started)
+            assert len(cb._queue) <= 4 + module._MAX_KEPT_EVENTS
+            assert cb._kept <= module._MAX_KEPT_EVENTS
+        early = sum(per_session[:200]) / 200
+        late = sum(per_session[-200:]) / 200
+        inner.release.set()
+        cb.flush()
+        cb.close()
+
+        assert late < 3 * early + 20e-6, f"per-session cost grew from {early * 1e6:.1f} to {late * 1e6:.1f} us"
+        assert inner.lifecycle[-3:] == ["start", "stop_requested", "shutdown"]  # the latest session survives
+        assert inner.ticks[-1] == 1999 * 10 + 4
 
     def test_session_boundaries_are_never_dropped(self) -> None:
         inner = _BlockingCallback()

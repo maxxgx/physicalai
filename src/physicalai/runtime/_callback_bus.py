@@ -71,16 +71,19 @@ class _CallbackBus:
         Callbacks that may block (e.g. RerunCallback) then run behind a small
         drop-oldest queue on their own thread and cannot stall the loop. Called
         at the start of a run, so a runtime that never runs starts no thread.
-        A marked callback with action hooks stays synchronous, with a warning.
+        Only a class that sets ``run_in_background = True`` itself is marked;
+        subclasses inherit nothing. A marked callback with action hooks stays
+        synchronous, with a warning. If setup fails, the next run tries again.
         """
         if self._background_started:
             return
-        self._background_started = True
         wrapped: list[Any] = []
         started: list[AsyncCallback] = []
         try:
             for cb in self._callbacks:
-                if getattr(cb, "run_in_background", False) is not True:
+                # The marker counts only on the class that sets it: a subclass of
+                # RerunCallback (with its own hooks) stays synchronous unless it opts in.
+                if vars(type(cb)).get("run_in_background") is not True:
                     wrapped.append(cb)
                 elif any(hasattr(cb, hook) for hook in _ACTION_HOOKS):
                     logger.warning(
@@ -98,6 +101,7 @@ class _CallbackBus:
                 worker._stop_worker()  # noqa: SLF001  # the user's callbacks stay the bus's to close
             raise
         self._callbacks = wrapped
+        self._background_started = True
 
     def emit_lifecycle(self, event: LifecycleEvent) -> None:
         for cb in self._callbacks:

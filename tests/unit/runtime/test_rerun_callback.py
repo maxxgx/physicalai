@@ -1034,9 +1034,7 @@ class TestRerunNeverBlocksControlLoop:
         cb.on_tick(_tick(step=1, camera_frames={"top": _fake_frame()}))
         assert cb._camera_names == ["top"]
 
-    def test_a_subclass_with_action_hooks_still_runs(
-        self, make_callback: Any, mock_rerun: MagicMock, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_a_subclass_with_action_hooks_still_runs(self, make_callback: Any, mock_rerun: MagicMock) -> None:
         from physicalai.runtime import RerunCallback
 
         class _ClampingRerun(RerunCallback):
@@ -1045,12 +1043,40 @@ class TestRerunNeverBlocksControlLoop:
 
         cb = _ClampingRerun(mode="spawn")
         runtime, ticks = self._runtime(cb)
-        with caplog.at_level("WARNING"), runtime:
+        with runtime:
             steps = runtime.run(duration_s=0.1)
 
         assert steps == 5
-        assert "_ClampingRerun asks to run in the background but defines action hooks" in caplog.text
+        assert runtime._bus._callbacks[1] is cb  # noqa: SLF001  # synchronous, as on main
         mock_rerun.log.assert_called()
+
+    def test_a_subclass_stop_hook_runs_in_order_on_the_control_thread(self, make_callback: Any) -> None:
+        # A subclass may take control of the robot on stop_requested; that must finish before shutdown.
+        import threading
+
+        from physicalai.runtime import RerunCallback
+
+        order: list[tuple[str, str]] = []
+
+        class _HandOver(RerunCallback):
+            def on_lifecycle(self, event: LifecycleEvent) -> None:
+                super().on_lifecycle(event)
+                order.append((event.event, threading.current_thread().name))
+
+        cb = _HandOver(mode="spawn")
+        runtime, _ = self._runtime(cb)
+        runtime._robot.disconnect.side_effect = lambda: order.append(("robot.disconnect", ""))  # noqa: SLF001
+        stop = threading.Event()
+        caller = threading.current_thread().name
+        threading.Timer(0.1, stop.set).start()
+        with runtime:
+            runtime.run(stop_event=stop)
+            order.append(("run returned", ""))
+
+        events = [name for name, _ in order]
+        assert events.index("stop_requested") < events.index("shutdown") < events.index("run returned")
+        assert events.index("run returned") < events.index("robot.disconnect")
+        assert all(thread == caller for name, thread in order if name in {"start", "stop_requested", "shutdown"})
 
     def test_direct_calls_stay_synchronous_on_the_callers_thread(
         self, make_callback: Any, mock_rerun: MagicMock

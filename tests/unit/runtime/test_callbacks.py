@@ -252,3 +252,100 @@ class TestAsyncCallback:
             thread.join(timeout=5.0)
 
         inner.close.assert_called_once()
+
+
+class _BlockingCallback:
+    """A callback whose hooks block until released (bounded, so a failing test cannot hang)."""
+
+    run_in_background = True
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.ticks: list[int] = []
+        self.closed = False
+
+    def on_tick(self, event: TickEvent) -> None:
+        self.release.wait(5.0)
+        self.ticks.append(event.step)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestBackgroundCallbacks:
+    def _tick(self, step: int) -> TickEvent:
+        return TestCallbackBus()._make_tick_event(step)
+
+    def test_a_blocking_background_callback_never_blocks_emit(self) -> None:
+        import time
+
+        inner = _BlockingCallback()
+        bus = _CallbackBus([inner])
+        wrapped = bus._callbacks[0]
+        assert isinstance(wrapped, AsyncCallback)
+        worst = 0.0
+        for step in range(500):
+            started = time.perf_counter()
+            bus.emit_tick(self._tick(step))
+            worst = max(worst, time.perf_counter() - started)
+            assert len(wrapped._queue) <= 16
+
+        assert worst < 0.005, f"worst emit_tick took {worst * 1000:.2f} ms"
+        inner.release.set()
+        bus.close()
+        assert inner.ticks[-1] == 499  # the newest events were kept, the oldest dropped
+        assert len(inner.ticks) <= 18  # in flight + 16 queued + a flush race at most
+
+    def test_shutdown_with_the_callback_still_blocked_is_bounded(self) -> None:
+        import time
+
+        inner = _BlockingCallback()
+        bus = _CallbackBus([inner])
+        for step in range(50):
+            bus.emit_tick(self._tick(step))
+        started = time.perf_counter()
+        bus.flush()  # what RobotRuntime.run() does at the end
+        bus.close()  # what RobotRuntime.close() does after disconnecting
+        took = time.perf_counter() - started
+        inner.release.set()
+
+        assert took < 2.0, f"flush and close took {took:.2f}s"
+        assert inner.closed
+
+    def test_plain_callbacks_stay_synchronous(self) -> None:
+        plain = MagicMock(spec=["on_tick"])
+        marked_false = MagicMock(spec=["on_tick", "run_in_background"])
+        marked_false.run_in_background = False
+        mock_with_everything = MagicMock()  # its auto-created attribute is not the marker
+        bus = _CallbackBus([plain, marked_false, mock_with_everything])
+
+        assert bus._callbacks == [plain, marked_false, mock_with_everything]
+        bus.emit_tick(self._tick(0))
+        plain.on_tick.assert_called_once()
+
+    def test_async_callback_flush_timeout_is_configurable(self) -> None:
+        import time
+
+        inner = _BlockingCallback()
+        cb = AsyncCallback(inner, max_queue=4, flush_timeout_s=0.2)
+        cb.on_tick(self._tick(0))
+        started = time.perf_counter()
+        cb.flush()
+        took = time.perf_counter() - started
+        inner.release.set()
+        cb.close()
+
+        assert 0.15 < took < 0.6, f"flush waited {took:.2f}s"
+
+    def test_close_drops_what_a_stuck_inner_has_not_reached(self) -> None:
+        inner = _BlockingCallback()
+        cb = AsyncCallback(inner, max_queue=16, flush_timeout_s=0.2)
+        for step in range(10):
+            cb.on_tick(self._tick(step))
+        cb.close()  # the inner is stuck in tick 0
+        inner.release.set()
+        cb._thread.join(2.0)
+
+        assert not cb._thread.is_alive()
+        assert inner.ticks == [0]  # it finished the event it was in, nothing queued after close
+        assert inner.closed

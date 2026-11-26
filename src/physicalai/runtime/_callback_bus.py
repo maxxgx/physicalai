@@ -8,6 +8,8 @@ import threading
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
+from physicalai.runtime.callbacks.async_callback import AsyncCallback
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -18,6 +20,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _INFERENCE_QUEUE_MAXLEN = 64
+_BACKGROUND_QUEUE = 16
+_BACKGROUND_FLUSH_TIMEOUT_S = 0.5
 
 
 class _CallbackBus:
@@ -39,7 +43,14 @@ class _CallbackBus:
     """
 
     def __init__(self, callbacks: Sequence[Any]) -> None:
-        self._callbacks = list(callbacks)
+        # Callbacks that may block (e.g. RerunCallback) run behind a small
+        # drop-oldest queue on their own thread, so they cannot stall the loop.
+        self._callbacks = [
+            AsyncCallback(cb, max_queue=_BACKGROUND_QUEUE, flush_timeout_s=_BACKGROUND_FLUSH_TIMEOUT_S)
+            if getattr(cb, "run_in_background", False) is True
+            else cb
+            for cb in callbacks
+        ]
         self._inference_queue: deque[InferenceEvent] = deque(maxlen=_INFERENCE_QUEUE_MAXLEN)
         self._close_lock = threading.Lock()
         self._closed = False

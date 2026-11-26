@@ -945,3 +945,79 @@ class TestRerunCallbackLifecycleMarker:
         log_calls = mock_rerun.log.call_args_list
         lifecycle_calls = [c for c in log_calls if "runtime/lifecycle/shutdown" in str(c.args[0])]
         assert len(lifecycle_calls) == 1
+
+
+@pytest.mark.usefixtures("_patch_rerun")
+class TestRerunNeverBlocksControlLoop:
+    """Rerun's SDK blocks ``rr.log`` once its send buffer is full (no viewer listening)."""
+
+    @staticmethod
+    def _runtime(callback: Any, monitor_closed: list[float] | None = None) -> tuple[Any, list[float], list[float]]:
+        import time
+
+        from physicalai.runtime import RobotRuntime
+        from tests.unit.runtime.conftest import FakeActionSource
+
+        robot = MagicMock()
+        robot.joint_names = ["a", "b"]
+        robot.get_observation.return_value = FakeRobotObservation(joint_positions=np.zeros(2))
+        disconnected: list[float] = []
+        robot.disconnect.side_effect = lambda: disconnected.append(time.perf_counter())
+        ticks: list[float] = []
+        stamp = MagicMock(spec=["on_tick"])
+        stamp.on_tick.side_effect = lambda _e: ticks.append(time.perf_counter())
+        runtime = RobotRuntime(robot=robot, action_source=FakeActionSource(), fps=50.0, callbacks=[stamp, callback])
+        return runtime, ticks, disconnected
+
+    def test_rerun_callback_is_marked_to_run_in_background(self, make_callback: Any) -> None:
+        from physicalai.runtime.callbacks.async_callback import AsyncCallback
+
+        runtime, _, _ = self._runtime(make_callback())
+        assert isinstance(runtime._bus._callbacks[1], AsyncCallback)  # noqa: SLF001
+
+    def test_a_blocked_rerun_never_stops_the_control_loop(self, make_callback: Any, mock_rerun: MagicMock) -> None:
+        import threading
+        import time
+
+        release = threading.Event()
+        # 0.25 s per call: long enough to show the stall, short enough that main fails in seconds.
+        mock_rerun.log.side_effect = lambda *_a, **_k: release.wait(0.25)
+        monitor = MagicMock()
+        monitor.poll.return_value = None
+        cb = make_callback(system_monitor=monitor)
+        runtime, ticks, disconnected = self._runtime(cb)
+        watchdog = threading.Timer(2.0, runtime.stop)  # ends a stalled run on main
+        watchdog.start()
+        with runtime:
+            steps = runtime.run(duration_s=0.5)
+            returned = time.perf_counter()
+        closed = time.perf_counter()
+        watchdog.cancel()
+        release.set()
+
+        assert steps == 25  # every tick ran at 50 Hz for 0.5 s
+        assert len(ticks) == 25
+        assert returned - ticks[-1] < 1.0, f"run() returned {returned - ticks[-1]:.2f}s after the last tick"
+        assert closed - ticks[-1] < 2.0, f"closed {closed - ticks[-1]:.2f}s after the last tick"
+        assert disconnected
+        monitor.close.assert_called_once_with()
+
+    def test_direct_calls_stay_synchronous_on_the_callers_thread(
+        self, make_callback: Any, mock_rerun: MagicMock
+    ) -> None:
+        # Studio's Rerun observer subclasses RerunCallback and calls the hooks itself on its own thread.
+        import threading
+
+        from physicalai.runtime import RerunCallback
+
+        class _Subclass(RerunCallback):
+            pass
+
+        threads: set[str] = set()
+        mock_rerun.log.side_effect = lambda *_a, **_k: threads.add(threading.current_thread().name)
+        cb = _Subclass(mode="spawn")
+        cb.on_lifecycle(_lifecycle_start())
+        cb.on_tick(_tick(step=0))
+        cb.close()
+
+        assert threads == {threading.current_thread().name}

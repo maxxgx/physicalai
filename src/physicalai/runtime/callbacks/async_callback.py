@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_CLOSE_TIMEOUT_S = 5.0
+_DEFAULT_FLUSH_TIMEOUT_S = 5.0
 _QUEUE_POLL_INTERVAL_S = 0.001
 
 
@@ -29,12 +29,18 @@ class AsyncCallback:
     """Wraps a callback so all hooks run on a dedicated background thread.
 
     The control loop takes two short locks and appends to a deque per event. On
-    overflow, oldest events are dropped.
+    overflow, oldest events are dropped. ``flush()`` and ``close()`` each wait at
+    most ``flush_timeout_s`` for the queue to drain.
     """
 
     _ACTION_HOOKS = ("on_action_ready", "on_action_sent")
 
-    def __init__(self, inner: Any, max_queue: int = 1024) -> None:  # noqa: D107, ANN401
+    def __init__(  # noqa: D107
+        self,
+        inner: Any,  # noqa: ANN401
+        max_queue: int = 1024,
+        flush_timeout_s: float = _DEFAULT_FLUSH_TIMEOUT_S,
+    ) -> None:
         if max_queue <= 0:
             msg = f"max_queue must be positive, got {max_queue}"
             raise ValueError(msg)
@@ -47,6 +53,7 @@ class AsyncCallback:
             raise TypeError(msg)
         self._inner = inner
         self._max_queue = max_queue
+        self._flush_timeout_s = flush_timeout_s
         self._queue: deque[tuple[str, Any]] = deque(maxlen=max_queue)
         self._queue_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -88,15 +95,21 @@ class AsyncCallback:
         self._enqueue("on_metrics", event)
 
     def close(self) -> None:
-        """Drain queued events, stop the worker, and close the inner callback."""
+        """Drain queued events, stop the worker, and close the inner callback.
+
+        Events still queued after ``flush_timeout_s`` are dropped, so a worker
+        that is stuck in the inner callback finishes at most the event it is in.
+        """
         with self._close_lock:
             if self._closed:
                 return
             self._closed = True
-        deadline = time.monotonic() + _CLOSE_TIMEOUT_S
+        deadline = time.monotonic() + self._flush_timeout_s
         try:
             self._flush_until(deadline)
         finally:
+            with self._queue_lock:
+                self._queue.clear()
             self._stop.set()
             self._has_work.set()
             self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -106,7 +119,7 @@ class AsyncCallback:
 
     def flush(self) -> None:
         """Wait until all events queued before this call are delivered."""
-        self._flush_until(time.monotonic() + _CLOSE_TIMEOUT_S)
+        self._flush_until(time.monotonic() + self._flush_timeout_s)
 
     def _flush_until(self, deadline: float) -> None:
         if not self._thread.is_alive():
@@ -118,14 +131,14 @@ class AsyncCallback:
                     self._queue.append(("_flush", done))
                     break
             if time.monotonic() >= deadline:
-                logger.warning("Async callback did not flush within %.1fs", _CLOSE_TIMEOUT_S)
+                logger.warning("Async callback did not flush within %.1fs", self._flush_timeout_s)
                 return
             time.sleep(_QUEUE_POLL_INTERVAL_S)
         else:
             return
         self._has_work.set()
         if not done.wait(timeout=max(0.0, deadline - time.monotonic())):
-            logger.warning("Async callback did not flush within %.1fs", _CLOSE_TIMEOUT_S)
+            logger.warning("Async callback did not flush within %.1fs", self._flush_timeout_s)
 
     def _enqueue(self, method: str, event: Any) -> None:  # noqa: ANN401
         with self._close_lock:

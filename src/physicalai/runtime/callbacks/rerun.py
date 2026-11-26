@@ -71,10 +71,15 @@ class RerunCallback:
     :class:`~physicalai.runtime.callbacks.system_monitor.SystemMonitor`. The
     callback resets it on session start and owns its cleanup via ``close()``.
 
-    Do NOT wrap with :class:`AsyncCallback` — Rerun's SDK already batches I/O
-    asynchronously.  The ``AsyncCallback`` guard (rejects inners with action
-    hooks) is not triggered because this class defines none, but wrapping would
-    double the buffering with no benefit.
+    Logging is best effort. Rerun's SDK blocks ``rr.log`` once its send buffer
+    is full, for example while no viewer is listening, so the hooks can block.
+    The class sets ``run_in_background = True``, and ``RobotRuntime`` runs it
+    behind :class:`AsyncCallback` (a queue of 16 events that drops the oldest,
+    flushed for at most 0.5 s at shutdown): the control loop never waits for
+    Rerun. Events are dropped while Rerun falls behind, and after Rerun stalls
+    nothing is guaranteed to reach the viewer or, with ``mode="save"``, the
+    ``.rrd`` file. Code that calls the hooks directly, as Studio's Rerun
+    observer does from its own thread, gets the synchronous behaviour.
 
     ``mode`` selects where data goes:
 
@@ -88,6 +93,9 @@ class RerunCallback:
       launch one.
     - ``"save"`` — write to ``save_path``; ``connect_addr`` is unused.
     """
+
+    run_in_background = True
+    """Tells ``RobotRuntime`` to run this callback behind :class:`AsyncCallback`."""
 
     def __init__(  # noqa: D107
         self,

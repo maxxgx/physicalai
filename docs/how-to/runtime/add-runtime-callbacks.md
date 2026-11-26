@@ -54,6 +54,8 @@ uv sync --extra observer-rerun
 
 Add `RerunCallback(mode="spawn")` to your runtime's `callbacks` list. The **Monitoring** sidebar contains separate Inference Latency, System, and GPU sections, in that order. System and GPU collection are scheduled at most once per second; inference statistics update with each completed inference. CPU percentages use the total capacity of all host logical cores. The adjacent **CPU %** and **GPU %** tabs plot utilization history using the same samples: host/process CPU and one GPU series per vendor/device ID. Unsupported GPU counters do not produce numeric samples, so missing data is never logged as zero. The charts follow the recording's selected wall-clock or step timeline and do not issue additional GPU queries.
 
+Rerun logging is best effort. `RobotRuntime` runs `RerunCallback` on a thread of its own behind a queue of 16 events that drops the oldest, so a missing or slow viewer costs plotted data, never control-loop time. At shutdown it waits at most 0.5 s per flush for that queue. With `mode="save"` the `.rrd` file can therefore miss data if Rerun falls behind.
+
 GPU monitoring uses read-only vendor commands found on `PATH`:
 
 - **NVIDIA:** `nvidia-smi` (installed with the NVIDIA driver) reports utilization, used/total memory, and temperature.

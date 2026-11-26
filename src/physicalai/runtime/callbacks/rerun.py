@@ -173,8 +173,8 @@ class RerunCallback:
         rr.log("runtime/stale_obs", rr.Scalars(float(event.stale_obs)))
         self._log_system_stats()
 
-        if self._camera_names is None:
-            # Discover camera names from the first tick's already-read frames —
+        if self._camera_names is None and event.source_updated:
+            # Discover camera names from the first source-updated tick (interpolated ticks carry no frames) —
             # no independent camera reference needed. Resend the blueprint once
             # real names are known (same pattern as the horizon refinement in
             # on_inference below).

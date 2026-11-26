@@ -405,6 +405,7 @@ class RobotRuntime:
             # into the next run() and silently zero-step every later session.
             try:
                 self._reset_session()
+                self._bus.start_background()
                 self._action_source.connect(bus=self._bus, session_id=self._session_id)
                 self._bus.emit_lifecycle(
                     LifecycleEvent(

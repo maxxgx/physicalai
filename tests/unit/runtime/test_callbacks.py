@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -16,6 +18,9 @@ from physicalai.runtime._callback_bus import _CallbackBus
 from physicalai.runtime import AsyncCallback, ConsoleCallback, JsonlCallback
 from physicalai.runtime.events import InferenceEvent, LifecycleEvent, TickEvent
 from tests.unit.runtime.conftest import FakeRobotObservation
+
+if TYPE_CHECKING:
+    from physicalai.capture.frame import Frame
 
 
 class TestCallbackBus:
@@ -261,15 +266,29 @@ class _BlockingCallback:
 
     def __init__(self) -> None:
         self.release = threading.Event()
+        self.entered = threading.Event()
         self.ticks: list[int] = []
-        self.closed = False
+        self.lifecycle: list[str] = []
+        self.closed_on: str | None = None
 
     def on_tick(self, event: TickEvent) -> None:
+        self.entered.set()
         self.release.wait(5.0)
         self.ticks.append(event.step)
 
+    def on_lifecycle(self, event: LifecycleEvent) -> None:
+        self.lifecycle.append(event.event)
+
     def close(self) -> None:
-        self.closed = True
+        self.closed_on = threading.current_thread().name
+
+
+def _lifecycle(event: str) -> LifecycleEvent:
+    return LifecycleEvent(session_id="test", timestamp=0.0, event=event, metadata={})
+
+
+def _workers() -> int:
+    return sum(t.name == "AsyncCallbackWorker" and t.is_alive() for t in threading.enumerate())
 
 
 class TestBackgroundCallbacks:
@@ -281,6 +300,7 @@ class TestBackgroundCallbacks:
 
         inner = _BlockingCallback()
         bus = _CallbackBus([inner])
+        bus.start_background()
         wrapped = bus._callbacks[0]
         assert isinstance(wrapped, AsyncCallback)
         worst = 0.0
@@ -293,6 +313,7 @@ class TestBackgroundCallbacks:
         assert worst < 0.005, f"worst emit_tick took {worst * 1000:.2f} ms"
         inner.release.set()
         bus.close()
+        wrapped._thread.join(2.0)
         assert inner.ticks[-1] == 499  # the newest events were kept, the oldest dropped
         assert len(inner.ticks) <= 18  # in flight + 16 queued + a flush race at most
 
@@ -301,16 +322,20 @@ class TestBackgroundCallbacks:
 
         inner = _BlockingCallback()
         bus = _CallbackBus([inner])
+        bus.start_background()
         for step in range(50):
             bus.emit_tick(self._tick(step))
+        assert inner.entered.wait(1.0)
         started = time.perf_counter()
         bus.flush()  # what RobotRuntime.run() does at the end
-        bus.close()  # what RobotRuntime.close() does after disconnecting
+        bus.close()  # what RobotRuntime.disconnect() does after disconnecting the robot
         took = time.perf_counter() - started
-        inner.release.set()
 
         assert took < 2.0, f"flush and close took {took:.2f}s"
-        assert inner.closed
+        assert inner.closed_on is None  # still busy: its close waits for the worker
+        inner.release.set()
+        bus._callbacks[0]._thread.join(2.0)
+        assert inner.closed_on == "AsyncCallbackWorker"
 
     def test_plain_callbacks_stay_synchronous(self) -> None:
         plain = MagicMock(spec=["on_tick"])
@@ -318,10 +343,102 @@ class TestBackgroundCallbacks:
         marked_false.run_in_background = False
         mock_with_everything = MagicMock()  # its auto-created attribute is not the marker
         bus = _CallbackBus([plain, marked_false, mock_with_everything])
+        bus.start_background()
 
         assert bus._callbacks == [plain, marked_false, mock_with_everything]
         bus.emit_tick(self._tick(0))
         plain.on_tick.assert_called_once()
+
+    def test_a_marked_callback_with_action_hooks_stays_synchronous(self, caplog: pytest.LogCaptureFixture) -> None:
+        class _WithActionHook(_BlockingCallback):
+            def on_action_ready(self, *, action: np.ndarray, step: int) -> np.ndarray:  # noqa: ARG002
+                return action
+
+        cb = _WithActionHook()
+        bus = _CallbackBus([cb])
+        with caplog.at_level("WARNING"):
+            bus.start_background()
+
+        assert bus._callbacks == [cb]
+        assert "defines action hooks; running it synchronously" in caplog.text
+        assert bus.invoke_on_action_ready(action=np.ones(2), step=0).tolist() == [1.0, 1.0]
+        bus.close()
+
+    def test_no_worker_starts_before_a_run(self) -> None:
+        from physicalai.runtime import RobotRuntime
+        from tests.unit.runtime.conftest import FakeActionSource
+
+        before = _workers()
+        robot = MagicMock()
+        robot.connect.side_effect = ConnectionError("robot unplugged")
+        runtime = RobotRuntime(robot=robot, action_source=FakeActionSource(), fps=30.0, callbacks=[_BlockingCallback()])
+        with pytest.raises(ConnectionError):
+            runtime.connect()
+
+        assert _workers() == before  # a failed connect leaves no thread behind
+
+    def test_a_failed_wrap_stops_the_workers_already_started(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import physicalai.runtime._callback_bus as bus_module
+
+        real = bus_module.AsyncCallback
+        made: list[AsyncCallback] = []
+
+        def flaky(inner: object, **kwargs: Any) -> AsyncCallback:
+            if made:
+                raise RuntimeError("second wrap fails")
+            made.append(real(inner, **kwargs))
+            return made[-1]
+
+        monkeypatch.setattr(bus_module, "AsyncCallback", flaky)
+        first, second = _BlockingCallback(), _BlockingCallback()
+        bus = _CallbackBus([first, second])
+        with pytest.raises(RuntimeError, match="second wrap fails"):
+            bus.start_background()
+        made[0]._thread.join(2.0)
+
+        assert not made[0]._thread.is_alive()
+        assert first.closed_on is None  # the user's callback is not closed by the rollback
+        bus.close()
+        assert first.closed_on == threading.current_thread().name
+
+    def test_session_boundaries_are_never_dropped(self) -> None:
+        inner = _BlockingCallback()
+        cb = AsyncCallback(inner, max_queue=4, flush_timeout_s=0.5)
+        cb.on_tick(self._tick(0))
+        assert inner.entered.wait(1.0)  # the worker is stuck in tick 0
+        cb.on_lifecycle(_lifecycle("shutdown"))
+        cb.on_lifecycle(_lifecycle("start"))
+        for step in range(1, 50):
+            cb.on_tick(self._tick(step))
+            cb.on_lifecycle(_lifecycle("send_error"))  # telemetry, may be dropped
+        inner.release.set()
+        cb.flush()
+        cb.close()
+
+        assert inner.lifecycle[:2] == ["shutdown", "start"]
+        assert inner.ticks[-1] == 49
+
+    def test_an_evicted_event_is_released_outside_the_locks(self) -> None:
+        held: list[bool] = []
+        inner = _BlockingCallback()
+        cb = AsyncCallback(inner, max_queue=1, flush_timeout_s=0.5)
+
+        class _Frame:
+            data = np.zeros(1)
+
+            def __del__(self) -> None:
+                held.append(cb._queue_lock.locked() or cb._close_lock.locked())
+
+        cb.on_tick(self._tick(0))
+        assert inner.entered.wait(1.0)
+        event = dataclasses.replace(self._tick(1), camera_frames={"top": cast("Frame", _Frame())})
+        cb.on_tick(event)
+        del event
+        cb.on_tick(self._tick(2))  # evicts tick 1 and its frame
+
+        assert held == [False]
+        inner.release.set()
+        cb.close()
 
     def test_async_callback_flush_timeout_is_configurable(self) -> None:
         import time
@@ -343,9 +460,10 @@ class TestBackgroundCallbacks:
         for step in range(10):
             cb.on_tick(self._tick(step))
         cb.close()  # the inner is stuck in tick 0
+        assert inner.closed_on is None  # not closed under a hook that is still running
         inner.release.set()
         cb._thread.join(2.0)
 
         assert not cb._thread.is_alive()
         assert inner.ticks == [0]  # it finished the event it was in, nothing queued after close
-        assert inner.closed
+        assert inner.closed_on == "AsyncCallbackWorker"

@@ -952,7 +952,7 @@ class TestRerunNeverBlocksControlLoop:
     """Rerun's SDK blocks ``rr.log`` once its send buffer is full (no viewer listening)."""
 
     @staticmethod
-    def _runtime(callback: Any, monitor_closed: list[float] | None = None) -> tuple[Any, list[float], list[float]]:
+    def _runtime(callback: Any) -> tuple[Any, list[float]]:
         import time
 
         from physicalai.runtime import RobotRuntime
@@ -961,46 +961,94 @@ class TestRerunNeverBlocksControlLoop:
         robot = MagicMock()
         robot.joint_names = ["a", "b"]
         robot.get_observation.return_value = FakeRobotObservation(joint_positions=np.zeros(2))
-        disconnected: list[float] = []
-        robot.disconnect.side_effect = lambda: disconnected.append(time.perf_counter())
         ticks: list[float] = []
         stamp = MagicMock(spec=["on_tick"])
         stamp.on_tick.side_effect = lambda _e: ticks.append(time.perf_counter())
         runtime = RobotRuntime(robot=robot, action_source=FakeActionSource(), fps=50.0, callbacks=[stamp, callback])
-        return runtime, ticks, disconnected
+        return runtime, ticks
 
     def test_rerun_callback_is_marked_to_run_in_background(self, make_callback: Any) -> None:
         from physicalai.runtime.callbacks.async_callback import AsyncCallback
 
-        runtime, _, _ = self._runtime(make_callback())
+        runtime, _ = self._runtime(make_callback())
+        runtime._bus.start_background()  # noqa: SLF001  # what run() does first
         assert isinstance(runtime._bus._callbacks[1], AsyncCallback)  # noqa: SLF001
+        runtime.disconnect()
 
-    def test_a_blocked_rerun_never_stops_the_control_loop(self, make_callback: Any, mock_rerun: MagicMock) -> None:
+    def test_a_blocked_rerun_never_stops_the_control_loop_and_recovers(
+        self, make_callback: Any, mock_rerun: MagicMock
+    ) -> None:
         import threading
         import time
 
+        entered = threading.Event()
         release = threading.Event()
-        # 0.25 s per call: long enough to show the stall, short enough that main fails in seconds.
-        mock_rerun.log.side_effect = lambda *_a, **_k: release.wait(0.25)
+        released_at: list[float] = []
+        logged: list[tuple[str, float]] = []
+
+        def log(path: str, *_a: Any, **_k: Any) -> None:
+            if not release.is_set():
+                entered.set()
+                release.wait(5.0)
+            logged.append((path, time.perf_counter()))
+
+        mock_rerun.log.side_effect = log
         monitor = MagicMock()
         monitor.poll.return_value = None
         cb = make_callback(system_monitor=monitor)
-        runtime, ticks, disconnected = self._runtime(cb)
-        watchdog = threading.Timer(2.0, runtime.stop)  # ends a stalled run on main
-        watchdog.start()
-        with runtime:
-            steps = runtime.run(duration_s=0.5)
-            returned = time.perf_counter()
-        closed = time.perf_counter()
-        watchdog.cancel()
-        release.set()
+        runtime, ticks = self._runtime(cb)
 
-        assert steps == 25  # every tick ran at 50 Hz for 0.5 s
-        assert len(ticks) == 25
-        assert returned - ticks[-1] < 1.0, f"run() returned {returned - ticks[-1]:.2f}s after the last tick"
-        assert closed - ticks[-1] < 2.0, f"closed {closed - ticks[-1]:.2f}s after the last tick"
-        assert disconnected
+        def unblock() -> None:
+            released_at.append(time.perf_counter())
+            release.set()
+
+        with runtime:
+            # Run 1: Rerun blocks from the first call and stays blocked.
+            steps_1 = runtime.run(duration_s=0.5)
+            returned_1 = time.perf_counter()
+            assert entered.is_set()  # the logging thread really was inside rr.log
+            # Run 2 starts while Rerun is still blocked; Rerun recovers half-way through it.
+            timer = threading.Timer(0.3, unblock)
+            timer.start()
+            steps_2 = runtime.run(duration_s=0.6)
+            timer.join()
+        worker = runtime._bus._callbacks[1]._thread  # noqa: SLF001
+        worker.join(2.0)
+
+        assert steps_1 == 25
+        assert steps_2 == 30
+        assert len(ticks) == 55
+        assert returned_1 - ticks[24] < 1.0, f"run() returned {returned_1 - ticks[24]:.2f}s after its last tick"
+        after_release = [path for path, at in logged if at > released_at[0]]
+        assert "runtime/lifecycle/start" in after_release  # session 2's start was kept and logged
+        assert after_release.count("robot/joints") >= 5  # ticks were delivered again after the release
         monitor.close.assert_called_once_with()
+
+    def test_camera_names_wait_for_a_tick_that_read_the_cameras(self, make_callback: Any) -> None:
+        cb = make_callback()
+        cb.on_lifecycle(_lifecycle_start())
+        cb.on_tick(_tick(step=0, source_updated=False))  # interpolated: no frames
+        assert cb._camera_names is None
+        cb.on_tick(_tick(step=1, camera_frames={"top": _fake_frame()}))
+        assert cb._camera_names == ["top"]
+
+    def test_a_subclass_with_action_hooks_still_runs(
+        self, make_callback: Any, mock_rerun: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from physicalai.runtime import RerunCallback
+
+        class _ClampingRerun(RerunCallback):
+            def on_action_ready(self, *, action: np.ndarray, step: int) -> np.ndarray:  # noqa: ARG002
+                return np.clip(action, -1.0, 1.0)
+
+        cb = _ClampingRerun(mode="spawn")
+        runtime, ticks = self._runtime(cb)
+        with caplog.at_level("WARNING"), runtime:
+            steps = runtime.run(duration_s=0.1)
+
+        assert steps == 5
+        assert "_ClampingRerun asks to run in the background but defines action hooks" in caplog.text
+        mock_rerun.log.assert_called()
 
     def test_direct_calls_stay_synchronous_on_the_callers_thread(
         self, make_callback: Any, mock_rerun: MagicMock

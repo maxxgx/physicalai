@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 _INFERENCE_QUEUE_MAXLEN = 64
 _BACKGROUND_QUEUE = 16
 _BACKGROUND_FLUSH_TIMEOUT_S = 0.5
+_ACTION_HOOKS = ("on_action_ready", "on_action_sent")  # AsyncCallback cannot forward these
 
 
 class _CallbackBus:
@@ -43,14 +44,8 @@ class _CallbackBus:
     """
 
     def __init__(self, callbacks: Sequence[Any]) -> None:
-        # Callbacks that may block (e.g. RerunCallback) run behind a small
-        # drop-oldest queue on their own thread, so they cannot stall the loop.
-        self._callbacks = [
-            AsyncCallback(cb, max_queue=_BACKGROUND_QUEUE, flush_timeout_s=_BACKGROUND_FLUSH_TIMEOUT_S)
-            if getattr(cb, "run_in_background", False) is True
-            else cb
-            for cb in callbacks
-        ]
+        self._callbacks = list(callbacks)
+        self._background_started = False
         self._inference_queue: deque[InferenceEvent] = deque(maxlen=_INFERENCE_QUEUE_MAXLEN)
         self._close_lock = threading.Lock()
         self._closed = False
@@ -69,6 +64,40 @@ class _CallbackBus:
     def emit_inference(self, event: InferenceEvent) -> None:
         """Enqueue inference event from background thread for control-thread delivery."""
         self._inference_queue.append(event)
+
+    def start_background(self) -> None:
+        """Put callbacks marked ``run_in_background`` behind :class:`AsyncCallback`, once.
+
+        Callbacks that may block (e.g. RerunCallback) then run behind a small
+        drop-oldest queue on their own thread and cannot stall the loop. Called
+        at the start of a run, so a runtime that never runs starts no thread.
+        A marked callback with action hooks stays synchronous, with a warning.
+        """
+        if self._background_started:
+            return
+        self._background_started = True
+        wrapped: list[Any] = []
+        started: list[AsyncCallback] = []
+        try:
+            for cb in self._callbacks:
+                if getattr(cb, "run_in_background", False) is not True:
+                    wrapped.append(cb)
+                elif any(hasattr(cb, hook) for hook in _ACTION_HOOKS):
+                    logger.warning(
+                        "%s asks to run in the background but defines action hooks; running it synchronously",
+                        type(cb).__name__,
+                    )
+                    wrapped.append(cb)
+                else:
+                    started.append(
+                        AsyncCallback(cb, max_queue=_BACKGROUND_QUEUE, flush_timeout_s=_BACKGROUND_FLUSH_TIMEOUT_S)
+                    )
+                    wrapped.append(started[-1])
+        except BaseException:
+            for worker in started:
+                worker._stop_worker()  # noqa: SLF001  # the user's callbacks stay the bus's to close
+            raise
+        self._callbacks = wrapped
 
     def emit_lifecycle(self, event: LifecycleEvent) -> None:
         for cb in self._callbacks:

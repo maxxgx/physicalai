@@ -1007,20 +1007,22 @@ class TestRerunNeverBlocksControlLoop:
             steps_1 = runtime.run(duration_s=0.5)
             returned_1 = time.perf_counter()
             assert entered.is_set()  # the logging thread really was inside rr.log
-            # Run 2 starts while Rerun is still blocked; Rerun recovers half-way through it.
-            timer = threading.Timer(0.3, unblock)
+            # Run 2 starts while Rerun is still blocked, and 25 ticks (more than the queue holds)
+            # pile up behind its start event before Rerun recovers.
+            timer = threading.Timer(0.5, unblock)
             timer.start()
-            steps_2 = runtime.run(duration_s=0.6)
+            steps_2 = runtime.run(duration_s=0.8)
             timer.join()
         worker = runtime._bus._callbacks[1]._thread  # noqa: SLF001
         worker.join(2.0)
 
         assert steps_1 == 25
-        assert steps_2 == 30
-        assert len(ticks) == 55
+        assert steps_2 == 40
+        assert len(ticks) == 65
         assert returned_1 - ticks[24] < 1.0, f"run() returned {returned_1 - ticks[24]:.2f}s after its last tick"
         after_release = [path for path, at in logged if at > released_at[0]]
-        assert "runtime/lifecycle/start" in after_release  # session 2's start was kept and logged
+        # Run 1's start finishes after the release, and run 2's start was kept despite the backlog.
+        assert after_release.count("runtime/lifecycle/start") == 2
         assert after_release.count("robot/joints") >= 5  # ticks were delivered again after the release
         monitor.close.assert_called_once_with()
 

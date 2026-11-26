@@ -74,12 +74,15 @@ class RerunCallback:
     Logging is best effort. Rerun's SDK blocks ``rr.log`` once its send buffer
     is full, for example while no viewer is listening, so the hooks can block.
     The class sets ``run_in_background = True``, and ``RobotRuntime`` runs it
-    behind :class:`AsyncCallback` (a queue of 16 events that drops the oldest,
-    flushed for at most 0.5 s at shutdown): the control loop never waits for
-    Rerun. Events are dropped while Rerun falls behind, and after Rerun stalls
-    nothing is guaranteed to reach the viewer or, with ``mode="save"``, the
-    ``.rrd`` file. Code that calls the hooks directly, as Studio's Rerun
-    observer does from its own thread, gets the synchronous behaviour.
+    behind :class:`AsyncCallback` (a queue of 16 events that drops the oldest
+    telemetry but keeps session start, stop and shutdown events, flushed for at
+    most 0.5 s at shutdown): the control loop never waits for Rerun. Events are
+    dropped while Rerun falls behind, and after Rerun stalls nothing is
+    guaranteed to reach the viewer or, with ``mode="save"``, the ``.rrd`` file.
+    A subclass that defines action hooks runs synchronously, with a warning,
+    since those must return on the control thread. Code that calls the hooks
+    directly, as Studio's Rerun observer does from its own thread, gets the
+    synchronous behaviour.
 
     ``mode`` selects where data goes:
 

@@ -579,7 +579,7 @@ class RerunCallback:
 
 
 def _flush_has_timeout(rr: Any) -> bool:  # noqa: ANN401
-    """Whether this rerun-sdk's ``RecordingStream.flush`` takes ``timeout_sec`` (0.26 only has ``blocking``).
+    """Whether this rerun-sdk's ``RecordingStream.flush`` takes ``timeout_sec`` (0.24.1 only has ``blocking``).
 
     Returns:
         True if ``flush(timeout_sec=...)`` is supported.

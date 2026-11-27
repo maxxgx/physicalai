@@ -25,7 +25,7 @@ _VIEWER_ANSWERS = "physicalai.runtime.callbacks.rerun._viewer_answers"
 def _flush_0_43(self: Any, *, timeout_sec: float = 1e38) -> None: ...
 
 
-def _flush_0_26(self: Any, blocking: bool = True) -> None: ...
+def _flush_0_24(self: Any, blocking: bool = True) -> None: ...
 
 
 @pytest.fixture()
@@ -1130,7 +1130,7 @@ class TestRerunCallbackNeverBlocks:
     def test_sdk_without_flush_timeout_keeps_main_behaviour(
         self, make_callback: Any, mock_rerun: MagicMock, caplog: pytest.LogCaptureFixture
     ) -> None:
-        mock_rerun.RecordingStream.flush = _flush_0_26
+        mock_rerun.RecordingStream.flush = _flush_0_24
         cb = make_callback()
         assert "has no flush(timeout_sec=...)" in caplog.text  # warned once, at construction
         cb.on_lifecycle(_lifecycle_start())
@@ -1139,11 +1139,11 @@ class TestRerunCallbackNeverBlocks:
         mock_rerun.get_data_recording.return_value.flush.assert_not_called()
         assert _logged(mock_rerun, "robot/joints")
 
-    def test_flush_timeout_is_detected_on_the_real_sdk_signature(self) -> None:
+    def test_flush_timeout_is_detected_from_the_flush_signature(self) -> None:
         from physicalai.runtime.callbacks.rerun import _flush_has_timeout
 
         new, old = MagicMock(), MagicMock()
-        new.RecordingStream.flush, old.RecordingStream.flush = _flush_0_43, _flush_0_26
+        new.RecordingStream.flush, old.RecordingStream.flush = _flush_0_43, _flush_0_24
         assert _flush_has_timeout(new)
         assert not _flush_has_timeout(old)
 

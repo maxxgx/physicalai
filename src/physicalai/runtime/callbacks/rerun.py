@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import colorsys
 import logging
+import socket
+import time
 from collections import deque
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
@@ -27,6 +29,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_RERUN_PORT = 9876
+_SINK_FLUSH_TIMEOUT_S = 0.002
+_SINK_RETRY_S = 1.0
+_CONNECT_PREFLIGHT_S = 0.5
 
 
 def _connect_port(addr: str) -> int:
@@ -75,6 +80,16 @@ class RerunCallback:
     asynchronously.  The ``AsyncCallback`` guard (rejects inners with action
     hooks) is not triggered because this class defines none, but wrapping would
     double the buffering with no benefit.
+
+    Rerun must never stall the control loop. ``rr.log`` blocks without a
+    timeout once the SDK's send queue is full, which happens within seconds
+    when the viewer is closed or stops reading. So before logging a tick,
+    lifecycle, inference or metrics event, the callback waits at most 2 ms for
+    the SDK to drain what was already logged. If it has not drained, that
+    event is not logged, a warning is printed once, and the check is retried
+    after 1 s. In ``"connect"`` mode the viewer port is probed (0.5 s timeout)
+    before connecting; if nothing answers, logging stays off until the next
+    session start. ``"save"`` mode is not checked.
 
     ``mode`` selects where data goes:
 
@@ -134,6 +149,35 @@ class RerunCallback:
         self._system_stats_rows = ""
         self._latency_stats_rows = ""
         self._gpu_stats_rows = ""
+        self._viewer_missing = False
+        self._sink_stalled = False
+        self._sink_retry_at = 0.0
+
+    def _sink_ready(self) -> bool:
+        """Return whether Rerun can take more data without blocking the control loop."""
+        if self._viewer_missing:
+            return False
+        if not self._initialized or self._mode == "save":
+            return True
+        now = time.monotonic()
+        if now < self._sink_retry_at:
+            return False
+        import rerun as rr  # noqa: PLC0415
+
+        recording = rr.get_data_recording()
+        try:
+            if recording is not None:
+                recording.flush(timeout_sec=_SINK_FLUSH_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 - the SDK raises a plain error on timeout
+            if not self._sink_stalled:
+                logger.warning("Rerun is not keeping up (viewer closed or slow); dropping Rerun logs until it does")
+            self._sink_stalled = True
+            self._sink_retry_at = now + _SINK_RETRY_S
+            return False
+        if self._sink_stalled:
+            logger.info("Rerun caught up; logging resumed")
+            self._sink_stalled = False
+        return True
 
     def on_lifecycle(self, event: LifecycleEvent) -> None:  # noqa: D102
         if event.event == "start":
@@ -145,12 +189,17 @@ class RerunCallback:
             self._latencies.clear()
             if not self._initialized:
                 self._init_rerun(event.session_id, event.metadata)
-        self._log_lifecycle_marker(event)
+        if self._sink_ready():
+            self._log_lifecycle_marker(event)
 
     def on_tick(self, event: TickEvent) -> None:  # noqa: D102
         import rerun as rr  # noqa: PLC0415
 
         self._last_step = event.step
+        if not self._sink_ready():
+            # Keep counting so image decimation stays on the same ticks after recovery.
+            self._source_ticks += event.source_updated
+            return
         rr.set_time("step", sequence=event.step)
         rr.set_time("wall", timestamp=event.timestamp)
 
@@ -179,8 +228,7 @@ class RerunCallback:
                 self._log_camera_frames(event.camera_frames)
             self._source_ticks += 1
 
-    @staticmethod
-    def on_metrics(event: MetricsEvent) -> None:
+    def on_metrics(self, event: MetricsEvent) -> None:
         """Log source-owned live values (currently just queue depth).
 
         Not every action source emits this (e.g. ``TeleopSource`` never does)
@@ -189,7 +237,7 @@ class RerunCallback:
         import rerun as rr  # noqa: PLC0415
 
         queue_remaining = event.values.get("queue_remaining")
-        if queue_remaining is None:
+        if queue_remaining is None or not self._sink_ready():
             return
         rr.set_time("step", sequence=event.step)
         rr.set_time("wall", timestamp=event.timestamp)
@@ -199,6 +247,8 @@ class RerunCallback:
         import numpy as np  # noqa: PLC0415
         import rerun as rr  # noqa: PLC0415
 
+        if not self._sink_ready():
+            return
         horizon = event.chunk.shape[0]
         n_joints = event.chunk.shape[1]
         start_step = self._last_step + 1
@@ -249,6 +299,10 @@ class RerunCallback:
     def _init_rerun(self, session_id: str, metadata: dict[str, Any]) -> None:
         import rerun as rr  # noqa: PLC0415
 
+        self._viewer_missing = self._mode == "connect" and not self._viewer_listening()
+        if self._viewer_missing:
+            logger.warning("No Rerun viewer at %s; Rerun logging is off until the next session", self._connect_url())
+            return
         rr.init(application_id=self._application_id, recording_id=session_id)
         if self._mode == "spawn":
             # The SDK hardcodes 127.0.0.1:9876 when spawning; pass the configured
@@ -257,15 +311,7 @@ class RerunCallback:
         elif self._mode == "save" and self._save_path is not None:
             rr.save(self._save_path)
         elif self._mode == "connect":
-            # Rerun 0.22+ uses gRPC. A bare "host:port" is wrapped into the
-            # canonical rerun+http://host:port/proxy URL.
-            addr = self._connect_addr or f"127.0.0.1:{_DEFAULT_RERUN_PORT}"
-            url = (
-                addr
-                if addr.startswith(("rerun://", "rerun+http://", "rerun+https://"))
-                else f"rerun+http://{addr}/proxy"
-            )
-            rr.connect_grpc(url=url)
+            rr.connect_grpc(url=self._connect_url())
 
         self._fps = metadata.get("fps", 30)
         self._multiplier = int(metadata.get("interpolation_multiplier", 1))
@@ -282,6 +328,32 @@ class RerunCallback:
             The configured port, or Rerun's default when ``connect_addr`` is unset.
         """
         return _DEFAULT_RERUN_PORT if self._connect_addr is None else _connect_port(self._connect_addr)
+
+    def _connect_url(self) -> str:
+        """Rerun 0.22+ uses gRPC; a bare ``host:port`` becomes ``rerun+http://host:port/proxy``.
+
+        Returns:
+            The gRPC URL to connect to.
+        """
+        addr = self._connect_addr or f"127.0.0.1:{_DEFAULT_RERUN_PORT}"
+        return (
+            addr if addr.startswith(("rerun://", "rerun+http://", "rerun+https://")) else f"rerun+http://{addr}/proxy"
+        )
+
+    def _viewer_listening(self) -> bool:
+        """Probe the viewer port, since ``rr.connect_grpc`` blocks for 5 s when nothing listens.
+
+        Returns:
+            False if the port refuses, times out or is invalid; True if it answers or the URL has no port.
+        """
+        try:
+            url = urlsplit(self._connect_url())
+            if url.port is None:  # the SDK picks the port; nothing to probe
+                return True
+            socket.create_connection((url.hostname, url.port), timeout=_CONNECT_PREFLIGHT_S).close()
+        except (OSError, ValueError):
+            return False
+        return True
 
     @staticmethod
     def _generate_joint_colors(n: int) -> list[list[int]]:

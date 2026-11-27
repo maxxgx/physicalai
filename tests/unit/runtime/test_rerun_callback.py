@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
+import logging
+import socket
 import sys
+import time
 from concurrent.futures import Future
 from typing import Any
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlsplit
 
 import numpy as np
 import pytest
@@ -15,6 +19,8 @@ from physicalai.runtime.callbacks.gpu_stats import GpuDeviceStats, GpuStatsSampl
 from physicalai.runtime.callbacks.system_monitor import LocalSystemMonitor, SystemStats, SystemStatsSample
 from physicalai.runtime.events import InferenceEvent, LifecycleEvent, MetricsEvent, TickEvent
 from tests.unit.runtime.conftest import FakeRobotObservation
+
+_CREATE_CONNECTION = "physicalai.runtime.callbacks.rerun.socket.create_connection"
 
 
 @pytest.fixture()
@@ -266,11 +272,17 @@ class TestRerunCallbackLifecycle:
         self, make_callback: Any, mock_rerun: MagicMock, connect_addr: str | None, expected_url: str
     ) -> None:
         cb = make_callback(mode="connect", connect_addr=connect_addr)
-        cb.on_lifecycle(_lifecycle_start())
+        with patch(_CREATE_CONNECTION) as probe:
+            cb.on_lifecycle(_lifecycle_start())
 
         mock_rerun.connect_grpc.assert_called_once_with(url=expected_url)
         mock_rerun.spawn.assert_not_called()
         mock_rerun.save.assert_not_called()
+        target = urlsplit(expected_url)
+        if target.port is None:
+            probe.assert_not_called()
+        else:
+            probe.assert_called_once_with((target.hostname, target.port), timeout=0.5)
 
     def test_lifecycle_marker_logged(self, make_callback: Any, mock_rerun: MagicMock) -> None:
         cb = make_callback()
@@ -945,3 +957,139 @@ class TestRerunCallbackLifecycleMarker:
         log_calls = mock_rerun.log.call_args_list
         lifecycle_calls = [c for c in log_calls if "runtime/lifecycle/shutdown" in str(c.args[0])]
         assert len(lifecycle_calls) == 1
+
+
+def _closed_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _logged(mock_rerun: MagicMock, prefix: str) -> bool:
+    return any(str(c.args[0]).startswith(prefix) for c in mock_rerun.log.call_args_list)
+
+
+@pytest.mark.usefixtures("_patch_rerun")
+class TestRerunCallbackNeverBlocks:
+    """rr.log blocks once Rerun's send queue is full, so a stalled viewer must not reach it."""
+
+    @pytest.fixture()
+    def clock(self) -> Any:
+        with patch("physicalai.runtime.callbacks.rerun.time") as fake_time:
+            fake_time.monotonic.return_value = 0.0
+            yield fake_time
+
+    def test_closed_port_does_not_stall_start_up(
+        self, make_callback: Any, mock_rerun: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        port = _closed_port()
+        cb = make_callback(mode="connect", connect_addr=f"127.0.0.1:{port}", image_decimation=1)
+
+        started = time.perf_counter()
+        cb.on_lifecycle(_lifecycle_start())
+        assert time.perf_counter() - started < 1.0
+        assert "No Rerun viewer at rerun+http://127.0.0.1:" in caplog.text
+        mock_rerun.init.assert_not_called()
+        mock_rerun.connect_grpc.assert_not_called()
+
+        cb.on_tick(_tick(step=0, camera_frames={"top": _fake_frame()}))
+        cb.on_metrics(_metrics(step=0))
+        cb.on_inference(_inference())
+        mock_rerun.log.assert_not_called()
+        mock_rerun.send_columns.assert_not_called()
+
+        # The next session tries again and connects once a viewer listens.
+        with socket.socket() as viewer:
+            viewer.bind(("127.0.0.1", port))
+            viewer.listen()
+            cb.on_lifecycle(_lifecycle_start(session_id="sess-2"))
+        mock_rerun.connect_grpc.assert_called_once_with(url=f"rerun+http://127.0.0.1:{port}/proxy")
+        assert _logged(mock_rerun, "runtime/lifecycle/start")
+
+    def test_unready_sink_skips_ticks_without_shifting_decimation(
+        self, make_callback: Any, mock_rerun: MagicMock, clock: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        flush = mock_rerun.get_data_recording.return_value.flush
+        # Tick 1 times out, tick 2 is inside the 1 s back-off, tick 4 times out again.
+        outcomes = {1: RuntimeError("timeout"), 4: RuntimeError("timeout")}
+        cb = make_callback(image_decimation=3)
+        cb.on_lifecycle(_lifecycle_start())
+
+        joints_at, images_at = [], []
+        for step, now in enumerate([0.0, 1.0, 1.5, 2.1, 2.2, 3.3, 3.4, 3.5]):
+            clock.monotonic.return_value = now
+            flush.side_effect = outcomes.get(step)
+            mock_rerun.reset_mock()
+            cb.on_tick(_tick(step=step, camera_frames={"top": _fake_frame()}))
+            if step == 2:
+                flush.assert_not_called()  # backing off, no poll
+            else:
+                flush.assert_called_once_with(timeout_sec=0.002)
+            joints_at += [step] if _logged(mock_rerun, "robot/joints") else []
+            images_at += [step] if _logged(mock_rerun, "camera/top") else []
+
+        assert joints_at == [0, 3, 5, 6, 7]
+        assert images_at == [0, 3, 6]  # the same ticks as with a healthy viewer
+        assert caplog.text.count("Rerun is not keeping up") == 2  # once per stall, not per tick
+
+    def test_logging_recovers_once_the_queue_drains(
+        self, make_callback: Any, mock_rerun: MagicMock, clock: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO, logger="physicalai.runtime.callbacks.rerun")
+        flush = mock_rerun.get_data_recording.return_value.flush
+        cb = make_callback()
+        cb.on_lifecycle(_lifecycle_start())
+        cb.on_tick(_tick(step=0))
+
+        flush.side_effect = RuntimeError("timeout")
+        mock_rerun.reset_mock()
+        for step in range(1, 4):
+            cb.on_tick(_tick(step=step))
+        cb.on_metrics(_metrics(step=3))
+        cb.on_inference(_inference())
+        cb.on_lifecycle(LifecycleEvent(session_id="sess-1", timestamp=2000.0, event="stop_requested", metadata={}))
+        mock_rerun.log.assert_not_called()
+        mock_rerun.send_columns.assert_not_called()
+        assert flush.call_count == 1  # one timed-out poll, then back-off
+
+        flush.side_effect = None
+        clock.monotonic.return_value = 1.0
+        cb.on_tick(_tick(step=4))
+        cb.on_metrics(_metrics(step=4))
+        cb.on_inference(_inference())
+
+        assert _logged(mock_rerun, "robot/joints")
+        assert _logged(mock_rerun, "queue/remaining")
+        mock_rerun.send_columns.assert_called_once()
+        assert "Rerun caught up; logging resumed" in caplog.text
+
+    def test_save_mode_is_not_polled(self, make_callback: Any, mock_rerun: MagicMock) -> None:
+        flush = mock_rerun.get_data_recording.return_value.flush
+        flush.side_effect = RuntimeError("would time out")
+        cb = make_callback(mode="save", save_path="/tmp/out.rrd")
+        cb.on_lifecycle(_lifecycle_start())
+        cb.on_tick(_tick(step=0))
+        cb.on_metrics(_metrics(step=0))
+
+        flush.assert_not_called()
+        assert _logged(mock_rerun, "robot/joints")
+        assert _logged(mock_rerun, "queue/remaining")
+
+    @pytest.mark.parametrize("connect_addr", ["rerun+http://example.com/proxy", "rerun://10.0.0.1/proxy"])
+    def test_url_without_port_skips_the_probe(
+        self, make_callback: Any, mock_rerun: MagicMock, connect_addr: str
+    ) -> None:
+        cb = make_callback(mode="connect", connect_addr=connect_addr)
+        with patch(_CREATE_CONNECTION) as probe:
+            cb.on_lifecycle(_lifecycle_start())
+
+        probe.assert_not_called()
+        mock_rerun.connect_grpc.assert_called_once_with(url=connect_addr)
+
+    def test_hooks_before_session_start_still_log(self, make_callback: Any, mock_rerun: MagicMock) -> None:
+        # Callers that drive the hooks without RerunCallback's own init (e.g. Studio) see main's behaviour.
+        cb = make_callback()
+        cb.on_metrics(_metrics(step=0))
+
+        mock_rerun.get_data_recording.return_value.flush.assert_not_called()
+        assert _logged(mock_rerun, "queue/remaining")

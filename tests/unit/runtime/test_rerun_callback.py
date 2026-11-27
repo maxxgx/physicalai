@@ -10,7 +10,6 @@ import time
 from concurrent.futures import Future
 from typing import Any
 from unittest.mock import MagicMock, patch
-from urllib.parse import urlsplit
 
 import numpy as np
 import pytest
@@ -20,7 +19,13 @@ from physicalai.runtime.callbacks.system_monitor import LocalSystemMonitor, Syst
 from physicalai.runtime.events import InferenceEvent, LifecycleEvent, MetricsEvent, TickEvent
 from tests.unit.runtime.conftest import FakeRobotObservation
 
-_CREATE_CONNECTION = "physicalai.runtime.callbacks.rerun.socket.create_connection"
+_VIEWER_ANSWERS = "physicalai.runtime.callbacks.rerun._viewer_answers"
+
+
+def _flush_0_43(self: Any, *, timeout_sec: float = 1e38) -> None: ...
+
+
+def _flush_0_26(self: Any, blocking: bool = True) -> None: ...
 
 
 @pytest.fixture()
@@ -35,6 +40,7 @@ def mock_rerun() -> MagicMock:
     rr.StateChange = MagicMock(side_effect=lambda *a, **kw: ("StateChange", a, kw))
     rr.Clear = MagicMock(side_effect=lambda *a, **kw: ("Clear", a, kw))
     rr.TimeColumn = MagicMock(side_effect=lambda *a, **kw: ("TimeColumn", a, kw))
+    rr.RecordingStream.flush = _flush_0_43  # signature only; calls go through get_data_recording()
     return rr
 
 
@@ -272,17 +278,13 @@ class TestRerunCallbackLifecycle:
         self, make_callback: Any, mock_rerun: MagicMock, connect_addr: str | None, expected_url: str
     ) -> None:
         cb = make_callback(mode="connect", connect_addr=connect_addr)
-        with patch(_CREATE_CONNECTION) as probe:
+        with patch(_VIEWER_ANSWERS, return_value=True) as probe:
             cb.on_lifecycle(_lifecycle_start())
 
         mock_rerun.connect_grpc.assert_called_once_with(url=expected_url)
         mock_rerun.spawn.assert_not_called()
         mock_rerun.save.assert_not_called()
-        target = urlsplit(expected_url)
-        if target.port is None:
-            probe.assert_not_called()
-        else:
-            probe.assert_called_once_with((target.hostname, target.port), timeout=0.5)
+        probe.assert_called_once_with(expected_url)
 
     def test_lifecycle_marker_logged(self, make_callback: Any, mock_rerun: MagicMock) -> None:
         cb = make_callback()
@@ -1075,16 +1077,47 @@ class TestRerunCallbackNeverBlocks:
         assert _logged(mock_rerun, "robot/joints")
         assert _logged(mock_rerun, "queue/remaining")
 
-    @pytest.mark.parametrize("connect_addr", ["rerun+http://example.com/proxy", "rerun://10.0.0.1/proxy"])
-    def test_url_without_port_skips_the_probe(
-        self, make_callback: Any, mock_rerun: MagicMock, connect_addr: str
-    ) -> None:
-        cb = make_callback(mode="connect", connect_addr=connect_addr)
-        with patch(_CREATE_CONNECTION) as probe:
-            cb.on_lifecycle(_lifecycle_start())
+    @pytest.mark.parametrize(
+        "url", ["rerun+http://example.com/proxy", "rerun://10.0.0.1/proxy", "rerun+https://example.com:9800/proxy"]
+    )
+    def test_probe_skips_implicit_ports_and_named_hosts(self, url: str) -> None:
+        from physicalai.runtime.callbacks.rerun import _viewer_answers
 
-        probe.assert_not_called()
-        mock_rerun.connect_grpc.assert_called_once_with(url=connect_addr)
+        with patch("physicalai.runtime.callbacks.rerun.socket.getaddrinfo") as resolve:
+            assert _viewer_answers(url)
+        resolve.assert_not_called()  # no DNS, no connect: the SDK connects as on main
+
+    def test_probe_refused_localhost_is_fast(self) -> None:
+        from physicalai.runtime.callbacks.rerun import _viewer_answers
+
+        started = time.perf_counter()
+        assert not _viewer_answers(f"rerun+http://localhost:{_closed_port()}/proxy")
+        assert time.perf_counter() - started < 0.5
+
+    def test_probe_has_one_budget_for_all_addresses(self) -> None:
+        from physicalai.runtime.callbacks.rerun import _viewer_answers
+
+        timeouts: list[float] = []
+
+        class _Silent:
+            """A socket whose connect waits out its whole timeout, like a dropped SYN."""
+
+            def __init__(self, *_: Any) -> None: ...
+            def __enter__(self) -> _Silent:
+                return self
+            def __exit__(self, *_: Any) -> None: ...
+            def settimeout(self, value: float) -> None:
+                timeouts.append(value)
+                self._timeout = value
+            def connect_ex(self, _addr: Any) -> int:
+                time.sleep(self._timeout)
+                return 60
+
+        started = time.perf_counter()
+        with patch("physicalai.runtime.callbacks.rerun.socket.socket", _Silent):
+            assert not _viewer_answers("rerun+http://localhost:9876/proxy")  # tries 127.0.0.1, then ::1
+        assert time.perf_counter() - started < 0.6
+        assert sum(timeouts) <= 0.5 + 1e-3
 
     def test_hooks_before_session_start_still_log(self, make_callback: Any, mock_rerun: MagicMock) -> None:
         # Callers that drive the hooks without RerunCallback's own init (e.g. Studio) see main's behaviour.
@@ -1092,4 +1125,79 @@ class TestRerunCallbackNeverBlocks:
         cb.on_metrics(_metrics(step=0))
 
         mock_rerun.get_data_recording.return_value.flush.assert_not_called()
+        assert _logged(mock_rerun, "queue/remaining")
+
+    def test_sdk_without_flush_timeout_keeps_main_behaviour(
+        self, make_callback: Any, mock_rerun: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        mock_rerun.RecordingStream.flush = _flush_0_26
+        cb = make_callback()
+        assert "has no flush(timeout_sec=...)" in caplog.text  # warned once, at construction
+        cb.on_lifecycle(_lifecycle_start())
+        cb.on_tick(_tick(step=0))
+
+        mock_rerun.get_data_recording.return_value.flush.assert_not_called()
+        assert _logged(mock_rerun, "robot/joints")
+
+    def test_flush_timeout_is_detected_on_the_real_sdk_signature(self) -> None:
+        from physicalai.runtime.callbacks.rerun import _flush_has_timeout
+
+        new, old = MagicMock(), MagicMock()
+        new.RecordingStream.flush, old.RecordingStream.flush = _flush_0_43, _flush_0_26
+        assert _flush_has_timeout(new)
+        assert not _flush_has_timeout(old)
+
+    def test_a_subclass_with_its_own_recording_is_not_polled(self, make_callback: Any, mock_rerun: MagicMock) -> None:
+        from physicalai.runtime import RerunCallback
+
+        class _ExternalRecording(RerunCallback):
+            """Like Studio's observer callback: it owns the recording, not RerunCallback."""
+
+            def _init_rerun(self, session_id: str, metadata: dict[str, Any]) -> None:
+                self._initialized = True
+
+        class _OptedIn(_ExternalRecording):
+            def _init_rerun(self, session_id: str, metadata: dict[str, Any]) -> None:
+                super()._init_rerun(session_id, metadata)
+                self._poll_sink = True
+
+        flush = mock_rerun.get_data_recording.return_value.flush
+        external, opted_in = _ExternalRecording(), _OptedIn()
+        for cb in (external, opted_in):
+            cb.on_lifecycle(_lifecycle_start())
+        flush.side_effect = RuntimeError("would time out")
+        mock_rerun.reset_mock()
+
+        external.on_tick(_tick(step=0))
+        flush.assert_not_called()
+        assert _logged(mock_rerun, "robot/joints")
+
+        mock_rerun.reset_mock()
+        opted_in.on_tick(_tick(step=0))
+        flush.assert_called_once()
+        assert not _logged(mock_rerun, "robot/joints")
+
+    def test_recovery_on_an_interpolated_tick_keeps_camera_discovery_pending(
+        self, make_callback: Any, mock_rerun: MagicMock, clock: MagicMock
+    ) -> None:
+        flush = mock_rerun.get_data_recording.return_value.flush
+        cb = make_callback(image_decimation=1)
+        cb.on_lifecycle(_lifecycle_start())
+
+        flush.side_effect = RuntimeError("timeout")
+        cb.on_tick(_tick(step=0, camera_frames={"top": _fake_frame()}))  # skipped
+        flush.side_effect = None
+        clock.monotonic.return_value = 1.0
+        cb.on_tick(_tick(step=1, source_updated=False))  # recovers on a tick without frames
+        assert cb._camera_names is None
+
+        cb.on_tick(_tick(step=2, camera_frames={"top": _fake_frame()}))
+        assert cb._camera_names == ["top"]
+        assert _logged(mock_rerun, "camera/top")
+
+    def test_on_metrics_still_works_on_the_class(self, make_callback: Any, mock_rerun: MagicMock) -> None:
+        from physicalai.runtime import RerunCallback
+
+        RerunCallback.on_metrics(_metrics(step=1))  # main's staticmethod call form
+
         assert _logged(mock_rerun, "queue/remaining")

@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import colorsys
+import inspect
+import ipaddress
 import logging
 import socket
 import time
+import types
 from collections import deque
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
@@ -55,6 +58,15 @@ def _connect_port(addr: str) -> int:
     return port
 
 
+class _MetricsHook:
+    """``on_metrics``: guarded on an instance; on the class it stays main's static ``on_metrics(event)``."""
+
+    def __get__(self, obj: object, objtype: type | None = None) -> Any:  # noqa: ANN401
+        if obj is None:
+            return objtype._log_metrics  # type: ignore[union-attr]  # noqa: SLF001
+        return types.MethodType(type(obj)._on_metrics_guarded, obj)  # type: ignore[attr-defined]  # noqa: SLF001
+
+
 @export_config(class_path="physicalai.runtime.RerunCallback")
 class RerunCallback:
     """In-process Rerun logging for runtime visualization.
@@ -87,9 +99,15 @@ class RerunCallback:
     lifecycle, inference or metrics event, the callback waits at most 2 ms for
     the SDK to drain what was already logged. If it has not drained, that
     event is not logged, a warning is printed once, and the check is retried
-    after 1 s. In ``"connect"`` mode the viewer port is probed (0.5 s timeout)
-    before connecting; if nothing answers, logging stays off until the next
-    session start. ``"save"`` mode is not checked.
+    after 1 s. Since a tick is logged only after everything before it has
+    drained, the SDK's queues hold at most one tick, so neither the check nor
+    ``rr.log`` waits on a full queue, unless a single tick logs more than the
+    SDK's 50 MiB input budget. In ``"connect"`` mode a numeric or ``localhost`` viewer address
+    is probed (0.5 s in total) before connecting; if nothing answers, logging
+    stays off until the next session start. ``"save"`` mode, recordings this
+    class did not create (a subclass overriding ``_init_rerun`` may set
+    ``_poll_sink = True`` to opt in) and rerun-sdk versions whose ``flush``
+    has no ``timeout_sec`` are not checked.
 
     ``mode`` selects where data goes:
 
@@ -125,7 +143,7 @@ class RerunCallback:
             _connect_port(connect_addr)
 
         # Fail fast if rerun-sdk is not installed.
-        import rerun as rr  # noqa: PLC0415, F401
+        import rerun as rr  # noqa: PLC0415
 
         self._image_decimation = image_decimation
         self._log_images = log_images
@@ -150,14 +168,23 @@ class RerunCallback:
         self._latency_stats_rows = ""
         self._gpu_stats_rows = ""
         self._viewer_missing = False
+        # Poll only sinks this class created in spawn/connect mode; a subclass that brings its
+        # own recording (Studio) keeps main's behaviour unless it sets this itself.
+        self._poll_sink = False
         self._sink_stalled = False
         self._sink_retry_at = 0.0
+        self._flush_has_timeout = _flush_has_timeout(rr)
+        if not self._flush_has_timeout and mode != "save":
+            logger.warning(
+                "rerun-sdk %s has no flush(timeout_sec=...); a closed or frozen viewer can stall the control loop",
+                getattr(rr, "__version__", "?"),
+            )
 
     def _sink_ready(self) -> bool:
         """Return whether Rerun can take more data without blocking the control loop."""
         if self._viewer_missing:
             return False
-        if not self._initialized or self._mode == "save":
+        if not self._poll_sink:
             return True
         now = time.monotonic()
         if now < self._sink_retry_at:
@@ -214,10 +241,10 @@ class RerunCallback:
         rr.log("runtime/stale_obs", rr.Scalars(float(event.stale_obs)))
         self._log_system_stats()
 
-        if self._camera_names is None:
-            # Discover camera names from the first tick's already-read frames —
-            # no independent camera reference needed. Resend the blueprint once
-            # real names are known (same pattern as the horizon refinement in
+        if self._camera_names is None and (event.source_updated or not self._log_images):
+            # Discover camera names from the first source-updated tick's already-read
+            # frames (interpolated ticks carry none) — no independent camera reference
+            # needed. Resend the blueprint once real names are known (same pattern as the horizon refinement in
             # on_inference below).
             self._camera_names = list(event.camera_frames.keys()) if self._log_images else []
             if self._camera_names:
@@ -228,7 +255,8 @@ class RerunCallback:
                 self._log_camera_frames(event.camera_frames)
             self._source_ticks += 1
 
-    def on_metrics(self, event: MetricsEvent) -> None:
+    @staticmethod
+    def _log_metrics(event: MetricsEvent) -> None:
         """Log source-owned live values (currently just queue depth).
 
         Not every action source emits this (e.g. ``TeleopSource`` never does)
@@ -237,11 +265,17 @@ class RerunCallback:
         import rerun as rr  # noqa: PLC0415
 
         queue_remaining = event.values.get("queue_remaining")
-        if queue_remaining is None or not self._sink_ready():
+        if queue_remaining is None:
             return
         rr.set_time("step", sequence=event.step)
         rr.set_time("wall", timestamp=event.timestamp)
         rr.log("queue/remaining", rr.Scalars(float(queue_remaining)))
+
+    def _on_metrics_guarded(self, event: MetricsEvent) -> None:
+        if "queue_remaining" in event.values and self._sink_ready():
+            self._log_metrics(event)
+
+    on_metrics = _MetricsHook()
 
     def on_inference(self, event: InferenceEvent) -> None:  # noqa: D102
         import numpy as np  # noqa: PLC0415
@@ -299,7 +333,7 @@ class RerunCallback:
     def _init_rerun(self, session_id: str, metadata: dict[str, Any]) -> None:
         import rerun as rr  # noqa: PLC0415
 
-        self._viewer_missing = self._mode == "connect" and not self._viewer_listening()
+        self._viewer_missing = self._mode == "connect" and not _viewer_answers(self._connect_url())
         if self._viewer_missing:
             logger.warning("No Rerun viewer at %s; Rerun logging is off until the next session", self._connect_url())
             return
@@ -312,6 +346,7 @@ class RerunCallback:
             rr.save(self._save_path)
         elif self._mode == "connect":
             rr.connect_grpc(url=self._connect_url())
+        self._poll_sink = self._mode != "save" and self._flush_has_timeout
 
         self._fps = metadata.get("fps", 30)
         self._multiplier = int(metadata.get("interpolation_multiplier", 1))
@@ -339,21 +374,6 @@ class RerunCallback:
         return (
             addr if addr.startswith(("rerun://", "rerun+http://", "rerun+https://")) else f"rerun+http://{addr}/proxy"
         )
-
-    def _viewer_listening(self) -> bool:
-        """Probe the viewer port, since ``rr.connect_grpc`` blocks for 5 s when nothing listens.
-
-        Returns:
-            False if the port refuses, times out or is invalid; True if it answers or the URL has no port.
-        """
-        try:
-            url = urlsplit(self._connect_url())
-            if url.port is None:  # the SDK picks the port; nothing to probe
-                return True
-            socket.create_connection((url.hostname, url.port), timeout=_CONNECT_PREFLIGHT_S).close()
-        except (OSError, ValueError):
-            return False
-        return True
 
     @staticmethod
     def _generate_joint_colors(n: int) -> list[list[int]]:
@@ -556,6 +576,60 @@ class RerunCallback:
             f"### GPU\n\n{header}{gpu}"
         )
         rr.log("runtime/monitoring", rr.TextDocument(md, media_type=rr.MediaType.MARKDOWN))
+
+
+def _flush_has_timeout(rr: Any) -> bool:  # noqa: ANN401
+    """Whether this rerun-sdk's ``RecordingStream.flush`` takes ``timeout_sec`` (0.26 only has ``blocking``).
+
+    Returns:
+        True if ``flush(timeout_sec=...)`` is supported.
+    """
+    try:
+        return "timeout_sec" in inspect.signature(rr.RecordingStream.flush).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _viewer_answers(url: str) -> bool:
+    """Probe a numeric or loopback viewer address within 0.5 s in total, without DNS.
+
+    ``rr.connect_grpc`` blocks for 5 s when nothing listens. Named hosts other than
+    ``localhost`` and URLs without a port are not probed (the SDK connects as before).
+
+    Returns:
+        False if every address refused or the budget ran out, or the URL is invalid; True otherwise.
+    """
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return False
+    if port is None or host is None:
+        return True
+    if host == "localhost":
+        hosts = ["127.0.0.1", "::1"]
+    else:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            return True
+        hosts = [host]
+    deadline = time.monotonic() + _CONNECT_PREFLIGHT_S
+    for candidate in hosts:
+        try:
+            for family, kind, proto, _, addr in socket.getaddrinfo(
+                candidate, port, type=socket.SOCK_STREAM, flags=socket.AI_NUMERICHOST
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                with socket.socket(family, kind, proto) as sock:
+                    sock.settimeout(remaining)
+                    if sock.connect_ex(addr) == 0:
+                        return True
+        except OSError:
+            continue
+    return False
 
 
 def _format_gpu_stats(sample: GpuStatsSample) -> str:
